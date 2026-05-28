@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ---------------------------------------------------------------------------
+# PEP 621 项目元数据
+# ---------------------------------------------------------------------------
+[project]
+name = "aimet-rx"
+version = "1.3.7"
+description = "AI Model Efficiency Toolkit - Redistributable Package"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.8"
+authors = [
+    { name = "Qualcomm Innovation Center" },
+]
+keywords = ["ai", "machine-learning", "model-optimization", "quantization", "compression"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# 运行时依赖动态读 requirements.txt，避免与 requirements.txt 双重维护
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/quic/aimet"
+
+# ---------------------------------------------------------------------------
+# setuptools 后端配置（替代旧 setup.py 中的对应字段）
+# ---------------------------------------------------------------------------
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = [
+    "aimet_common",
+    "aimet_common.*",
+    "aimet_onnx",
+    "aimet_onnx.*",
+    "aimet_torch",
+    "aimet_torch.*",
+    "export_onnx_and_encodings",
+    "export_onnx_and_encodings.*",
+]
+
+[tool.setuptools.package-data]
+aimet_common = ["*.json", "*.so", "*.pyd", "*.dll", "bin/*"]
+aimet_onnx = ["*.json", "*.so", "*.pyd", "*.dll"]
+aimet_torch = ["*.json", "*.so", "*.pyd", "*.dll"]
+export_onnx_and_encodings = ["*.json", "*.pt", "data/*"]

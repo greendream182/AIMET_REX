@@ -1,0 +1,4 @@
+{
+  "description": "Matches test_requantize.test_round_shift_half_away_from_zero_signed",
+  "rounding": "half_away_from_zero"
+}

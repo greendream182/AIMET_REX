@@ -1,0 +1,673 @@
+{
+  "generated_at": "2026-05-22T06:40:31+00:00",
+  "torch_version": "2.10.0+cu128",
+  "pwl_vs_analytic": {
+    "cases": [
+      {
+        "fn_name": "sigmoid",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": 0,
+          "qmax": 32767,
+          "range": 1.0
+        },
+        "metrics": {
+          "max_lsb": 246.0,
+          "p99_lsb": 187.05000000000018,
+          "p999_lsb": 239.9050000000002,
+          "rmse_lsb": 55.34633278487722,
+          "cosine_similarity": 0.9999967217445374,
+          "max_relative_error": 0.17162789404392242
+        },
+        "limits": {
+          "max_lsb": 320.0,
+          "p99_lsb": 260.0,
+          "rmse_lsb": 80.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "fn_name": "tanh",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": -32768,
+          "qmax": 32767,
+          "range": 1.0
+        },
+        "metrics": {
+          "max_lsb": 1810.0,
+          "p99_lsb": 1296.0500000000002,
+          "p999_lsb": 1721.0,
+          "rmse_lsb": 323.42435057811434,
+          "cosine_similarity": 0.9999443292617798,
+          "max_relative_error": 23.292339324951172
+        },
+        "limits": {
+          "max_lsb": 2400.0,
+          "p99_lsb": 1700.0,
+          "rmse_lsb": 450.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "fn_name": "gelu",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": -32768,
+          "qmax": 32767,
+          "range": 8.0
+        },
+        "metrics": {
+          "max_lsb": 213.0,
+          "p99_lsb": 149.05000000000018,
+          "p999_lsb": 202.0,
+          "rmse_lsb": 32.98814965374877,
+          "cosine_similarity": 0.9999969601631165,
+          "max_relative_error": 42.54820251464844
+        },
+        "limits": {
+          "max_lsb": 320.0,
+          "p99_lsb": 240.0,
+          "rmse_lsb": 60.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "fn_name": "silu",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": -32768,
+          "qmax": 32767,
+          "range": 8.0
+        },
+        "metrics": {
+          "max_lsb": 148.0,
+          "p99_lsb": 108.05000000000018,
+          "p999_lsb": 140.9050000000002,
+          "rmse_lsb": 25.271504224743925,
+          "cosine_similarity": 0.999998152256012,
+          "max_relative_error": 29.377830505371094
+        },
+        "limits": {
+          "max_lsb": 200.0,
+          "p99_lsb": 160.0,
+          "rmse_lsb": 45.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "fn_name": "softplus",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": 0,
+          "qmax": 32767,
+          "range": 8.0
+        },
+        "metrics": {
+          "max_lsb": 78.0,
+          "p99_lsb": 58.05000000000018,
+          "p999_lsb": 75.0,
+          "rmse_lsb": 15.584173224079775,
+          "cosine_similarity": 0.9999992847442627,
+          "max_relative_error": 0.24876654148101807
+        },
+        "limits": {
+          "max_lsb": 320.0,
+          "p99_lsb": 240.0,
+          "rmse_lsb": 60.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "fn_name": "mish",
+        "num_segments": 16,
+        "input_range": [
+          -8.0,
+          8.0
+        ],
+        "output_grid": {
+          "qmin": -32768,
+          "qmax": 32767,
+          "range": 8.0
+        },
+        "metrics": {
+          "max_lsb": 190.0,
+          "p99_lsb": 126.0,
+          "p999_lsb": 170.9050000000002,
+          "rmse_lsb": 28.46923881303731,
+          "cosine_similarity": 0.9999976754188538,
+          "max_relative_error": 29.655317306518555
+        },
+        "limits": {
+          "max_lsb": 320.0,
+          "p99_lsb": 240.0,
+          "rmse_lsb": 60.0,
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      }
+    ]
+  },
+  "int16_vs_fp32": {
+    "cases": [
+      {
+        "case": "Linear → ReLU → Linear",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 128,
+        "output_bitwidth": 8,
+        "output_scale": 0.01568627543747425,
+        "metrics": {
+          "max_abs_error": 0.0,
+          "rmse": 0.0,
+          "cosine_similarity": 1.0,
+          "sqnr_db": Infinity,
+          "max_error_lsb_float": 0.0,
+          "max_error_lsb": 0.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Sigmoid (PWL)",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 192,
+        "output_bitwidth": 8,
+        "output_scale": 0.003921568859368563,
+        "metrics": {
+          "max_abs_error": 0.003921568393707275,
+          "rmse": 0.0026397863402962685,
+          "cosine_similarity": 0.9999886751174927,
+          "sqnr_db": 44.92739783739691,
+          "max_error_lsb_float": 0.9999998807907104,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Tanh (PWL)",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 192,
+        "output_bitwidth": 8,
+        "output_scale": 0.007843137718737125,
+        "metrics": {
+          "max_abs_error": 0.00784313678741455,
+          "rmse": 0.0049990382976830006,
+          "cosine_similarity": 0.9994877576828003,
+          "sqnr_db": 29.891246468993245,
+          "max_error_lsb_float": 0.9999998807907104,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9994,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → GELU → Linear (PWL)",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 128,
+        "output_bitwidth": 8,
+        "output_scale": 0.01568627543747425,
+        "metrics": {
+          "max_abs_error": 0.0156862773001194,
+          "rmse": 0.008985443040728569,
+          "cosine_similarity": 0.9714148044586182,
+          "sqnr_db": 11.869832135415333,
+          "max_error_lsb_float": 1.0000001192092896,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.97,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Conv2d",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 72,
+        "output_bitwidth": 8,
+        "output_scale": 0.0313725508749485,
+        "metrics": {
+          "max_abs_error": 0.0,
+          "rmse": 0.0,
+          "cosine_similarity": 1.0000001192092896,
+          "sqnr_db": Infinity,
+          "max_error_lsb_float": 0.0,
+          "max_error_lsb": 0.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Softmax (PWL exp)",
+        "stress": "deploy-8b",
+        "informational": false,
+        "n_samples": 256,
+        "output_bitwidth": 8,
+        "output_scale": 0.003921568859368563,
+        "metrics": {
+          "max_abs_error": 0.003921568393707275,
+          "rmse": 0.003921568393707275,
+          "cosine_similarity": 0.9999999403953552,
+          "sqnr_db": 36.12360050704291,
+          "max_error_lsb_float": 0.9999998807907104,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.999,
+          "max_error_lsb": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Sigmoid (PWL) [stress]",
+        "stress": "stress-16b-out",
+        "informational": true,
+        "n_samples": 192,
+        "output_bitwidth": 16,
+        "output_scale": 1.5259021893143654e-05,
+        "metrics": {
+          "max_abs_error": 0.00079345703125,
+          "rmse": 0.0002279852342326194,
+          "cosine_similarity": 0.9999998807907104,
+          "sqnr_db": 66.20650723108595,
+          "max_error_lsb_float": 51.99920654296875,
+          "max_error_lsb": 52.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Tanh (PWL) [stress]",
+        "stress": "stress-16b-out",
+        "informational": true,
+        "n_samples": 192,
+        "output_bitwidth": 16,
+        "output_scale": 3.051804378628731e-05,
+        "metrics": {
+          "max_abs_error": 0.00317387655377388,
+          "rmse": 0.00174320163205266,
+          "cosine_similarity": 0.9999520182609558,
+          "sqnr_db": 39.20184612330216,
+          "max_error_lsb_float": 104.0,
+          "max_error_lsb": 104.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → GELU → Linear (PWL) [stress]",
+        "stress": "stress-16b-out",
+        "informational": true,
+        "n_samples": 128,
+        "output_bitwidth": 16,
+        "output_scale": 6.103608757257462e-05,
+        "metrics": {
+          "max_abs_error": 0.002563515678048134,
+          "rmse": 0.0012640145141631365,
+          "cosine_similarity": 0.9993984699249268,
+          "sqnr_db": 29.168407594430384,
+          "max_error_lsb_float": 42.0,
+          "max_error_lsb": 42.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9993
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Linear → Softmax (PWL exp) [stress]",
+        "stress": "stress-16b-out",
+        "informational": true,
+        "n_samples": 256,
+        "output_bitwidth": 16,
+        "output_scale": 1.5259021893143654e-05,
+        "metrics": {
+          "max_abs_error": 1.52587890625e-05,
+          "rmse": 1.52587890625e-05,
+          "cosine_similarity": 1.0,
+          "sqnr_db": 84.28853132005024,
+          "max_error_lsb_float": 0.9999847412109375,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9995
+        },
+        "failures": [],
+        "status": "PASS"
+      }
+    ]
+  },
+  "fp16_vs_fp32": {
+    "cases": [
+      {
+        "case": "random_4x8",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999
+        },
+        "status": "PASS"
+      },
+      {
+        "case": "random_2x16x16",
+        "metrics": {
+          "cosine_similarity": 0.9999998807907104
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999
+        },
+        "status": "PASS"
+      },
+      {
+        "case": "uniform_8",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9999
+        },
+        "status": "PASS"
+      }
+    ]
+  },
+  "mobilenet_v2": {
+    "input_size": 64,
+    "missing_oq_before_patch": 34,
+    "oq_patched": 34,
+    "cases": [
+      {
+        "case": "MockMobileNetV2 / INT16 vs FP32_QDQ",
+        "stress": "deploy-8b",
+        "output_bitwidth": 8,
+        "output_scale": 4.928739372189739e-07,
+        "n_samples": 20,
+        "metrics": {
+          "max_abs_error": 4.928751877741888e-07,
+          "rmse": 3.1172069725471374e-07,
+          "cosine_similarity": 0.9999557137489319,
+          "sqnr_db": 39.67794048094598,
+          "max_error_lsb_float": 1.0000025033950806,
+          "max_error_lsb": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "MockMobileNetV2 / FP16 vs FP32_QDQ",
+        "stress": "deploy-fp16",
+        "metrics": {
+          "cosine_similarity": 0.9998862743377686
+        },
+        "limits": {
+          "min_cosine_similarity": 0.999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "MockMobileNetV2 / fixed_scale_qdq vs FP32_QDQ",
+        "stress": "deploy-fixed-scale",
+        "metrics": {
+          "max_abs_error": 4.928751877741888e-07,
+          "rmse": 2.915882362231059e-07,
+          "cosine_similarity": 0.999953031539917,
+          "sqnr_db": 40.25785363391251
+        },
+        "limits": {
+          "min_cosine_similarity": 0.9998
+        },
+        "failures": [],
+        "status": "PASS"
+      }
+    ]
+  },
+  "runtime_notes": [
+    "ConnectedGraph: Unable to isolate model outputs (prepared MobileNet with functional Mean/Add).",
+    "Quant: Unsupported op type Mean / Shape / If (graph preparer placeholders).",
+    "v2 AutoQuant may print ignored torch.export SpecViolationError when ONNX export is attempted on prepared models; use --quiet to skip AutoQuant.",
+    "cvxpy optional: AMP convert-op reduction logs at debug when cvxpy is absent."
+  ],
+  "report_options": {
+    "fast": false,
+    "quiet": false,
+    "skip_autoquant": false
+  },
+  "mobilenet_v2_ptq_qat": {
+    "mock_input_size": 64,
+    "full_input_size": 96,
+    "holdout_seed": 13,
+    "qat_epochs": 8,
+    "adaround_iterations": 80,
+    "include_long_adaround": false,
+    "skip_autoquant": false,
+    "suppress_autoquant_logs": false,
+    "qat_final_epoch_loss": 16282.005859375,
+    "qat_summary": {
+      "ptq_only_cosine": 0.9999428391456604,
+      "qat_cosine": 1.0,
+      "cosine_delta_vs_ptq": 5.716085433959961e-05,
+      "status": "PASS",
+      "report_epochs": 8,
+      "pytest_epochs_reference": 20,
+      "final_epoch_mse": 16282.005859375
+    },
+    "cases": [
+      {
+        "case": "Mock PTQ vanilla (min-max)",
+        "metrics": {
+          "cosine_similarity": 0.9999428391456604
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": null
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Mock PTQ + CLE",
+        "metrics": {
+          "cosine_similarity": 0.9999348521232605
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.9949428391456604
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Mock PTQ + bias correction",
+        "metrics": {
+          "cosine_similarity": 0.9999517798423767
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.9899428391456604
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Mock PTQ + AdaRound (80 iter)",
+        "metrics": {
+          "cosine_similarity": 0.9999164938926697
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.9998428391456604
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Mock PTQ + INT16 QAT (8 ep)",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.9999428391456604
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Full PTQ vanilla (min-max)",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": null
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Full PTQ + CLE",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.995
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Full PTQ + bias correction",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.99
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Full PTQ + AdaRound (80 iter)",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 0.9999
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Full PTQ + INT16 QAT (4 ep)",
+        "metrics": {
+          "cosine_similarity": 1.0
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": 1.0
+        },
+        "failures": [],
+        "status": "PASS"
+      },
+      {
+        "case": "Mock combined PTQ (CLE+BC+AdaRound) → INT16",
+        "metrics": {
+          "cosine_similarity": 0.9999539256095886
+        },
+        "limits": {
+          "min_cosine_similarity": 0.99,
+          "min_vs_reference": null
+        },
+        "failures": [],
+        "status": "PASS",
+        "informational": false,
+        "ptq_source": "combined_fallback",
+        "autoquant_eval_score": 0.9999998807907104,
+        "encoding_path": "/tmp/tmpt9j0vwwq/adaround"
+      }
+    ]
+  },
+  "pytest": {
+    "cmd": "/usr/bin/python3 -m pytest tests/fixed_point -q --no-header --tb=line -m not slow",
+    "marker": "not slow",
+    "exit_code": 0,
+    "summary_line": "183 passed, 2 skipped, 7 deselected, 183 warnings in 186.80s (0:03:06)",
+    "counts": {
+      "passed": 183,
+      "failed": 0,
+      "skipped": 2,
+      "errors": 0,
+      "warnings": 183
+    },
+    "failure_tail": null
+  }
+}

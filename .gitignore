@@ -1,0 +1,88 @@
+# ===== IDE / 编辑器 =====
+.idea/
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+
+# ===== Python 字节码 / 缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ===== 打包 / 构建产物 =====
+build/
+dist/
+*.egg-info/
+*.egg
+aimet_rx.egg-info/
+pip-wheel-metadata/
+.eggs/
+
+# ===== 测试 / 覆盖率 =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# ===== 类型检查 / Lint 缓存 =====
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== 项目临时目录 =====
+/tmp/
+
+# ===== 训练 / 量化 产物 =====
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# ONNX 模型
+*.onnx
+
+# 量化编码文件
+*.encodings
+
+# 日志
+*.log
+logs/
+
+# ===== 示例 / 实验输出 =====
+examples/output/
+examples/**/output/
+export_onnx_and_encodings/**/output/
+
+# ===== 大文件 / 数据集（可按需调整） =====
+*.h5
+*.hdf5
+*.npy
+*.npz
+# Committed golden vectors for fixed-point regression (spec 13)
+!tests/fixed_point/data/*.npz
+*.tar
+*.tar.gz
+*.zip

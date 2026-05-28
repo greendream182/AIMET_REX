@@ -1,0 +1,32 @@
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+onnx>=1.11.0
+onnxruntime>=1.13.0
+torch>=1.13.0
+pillow>=8.0.0
+
+# Visualization
+bokeh>=2.4.0
+
+# Configuration
+jsonschema>=3.2.0
+
+# AdaRound (memory guard in aimet_torch/_base/adaround/adaround_optimizer.py)
+psutil>=5.8.0
+
+# Optional dependencies
+# tensorboard>=2.8.0
+
+
+
+
+
+
+
+
+
+
+
+
+

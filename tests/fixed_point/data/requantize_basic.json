@@ -1,0 +1,4 @@
+{
+  "description": "Half-to-even requantize; matches test_requantize.test_requantize_int_basic_half_to_even",
+  "expected_dtype": "int16"
+}

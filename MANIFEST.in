@@ -1,0 +1,43 @@
+# Include documentation
+include README.md
+include LICENSE
+include requirements.txt
+
+# Include all JSON config files
+recursive-include aimet_common *.json
+recursive-include aimet_onnx *.json
+recursive-include aimet_torch *.json
+
+# Include all Python stub files
+recursive-include aimet_common *.pyi
+recursive-include aimet_onnx *.pyi
+recursive-include aimet_torch *.pyi
+
+# Include binary files if any
+recursive-include aimet_common *.so *.pyd *.dll
+recursive-include aimet_onnx *.so *.pyd *.dll
+recursive-include aimet_torch *.so *.pyd *.dll
+
+# Include bin directory
+recursive-include aimet_common/bin *
+
+# Include export_onnx_and_encodings module
+recursive-include export_onnx_and_encodings *.py *.json *.pt
+recursive-include export_onnx_and_encodings/data *
+
+# Exclude compiled Python files
+global-exclude __pycache__
+global-exclude *.py[co]
+
+
+
+
+
+
+
+
+
+
+
+
+

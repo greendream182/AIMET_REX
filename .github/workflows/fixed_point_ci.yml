@@ -1,0 +1,114 @@
+# Fixed-point regression (spec 14). PR: fast tests + baseline; nightly: full suite.
+name: fixed_point_ci
+
+on:
+  pull_request:
+    paths:
+      - "aimet_torch/fixed_point/**"
+      - "aimet_torch/v2/quantization/affine/fixed_point/**"
+      - "aimet_torch/v1/fixed_point_dispatch.py"
+      - "aimet_torch/v1/fixed_scale_qdq.py"
+      - "tests/fixed_point/**"
+      - "scripts/fixed_point/**"
+      - "doc/FixedPoint_Quantization_Spec/**"
+      - "doc/FixedPoint_Quantization_Design_v2.md"
+      - ".github/workflows/fixed_point_ci.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "aimet_torch/fixed_point/**"
+      - "tests/fixed_point/**"
+      - "scripts/fixed_point/**"
+      - ".github/workflows/fixed_point_ci.yml"
+    # push to main uses the same fast gate as PR (not the nightly cron job)
+  schedule:
+    # Nightly UTC 02:00 — full tests + quality report (spec 14)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fixed-point-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  AIMET_RX_QUANT_EXECUTION_MODE: fp32_qdq
+
+jobs:
+  pr-fast:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: L1-L3 pytest + coverage gate (>= 85%)
+        run: |
+          python -m coverage run -m pytest tests/fixed_point \
+            -m "not slow and not imagenet" -q --tb=short
+          python -m coverage report
+
+      - name: Fast quality report vs baseline
+        run: |
+          python scripts/fixed_point/run_quality_report.py --fast --check-baseline
+
+      - name: Upload quality report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-report-pr
+          path: scripts/fixed_point/reports/
+          if-no-files-found: ignore
+
+  nightly-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Full fixed_point pytest (incl. slow)
+        run: |
+          python -m pytest tests/fixed_point -q --tb=line \
+            -m "not imagenet" \
+            --junitxml=reports/fixed_point_junit.xml
+
+      - name: Coverage report
+        run: |
+          python -m coverage run -m pytest tests/fixed_point -m "not imagenet" -q --tb=no
+          python -m coverage report
+          python -m coverage html
+
+      - name: Quality report + baseline
+        run: |
+          python scripts/fixed_point/run_quality_report.py --check-baseline
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-point-nightly
+          path: |
+            scripts/fixed_point/reports/
+            reports/fixed_point_junit.xml
+          if-no-files-found: ignore

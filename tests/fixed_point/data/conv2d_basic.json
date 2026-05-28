@@ -1,0 +1,4 @@
+{
+  "description": "Matches test_conv_linear.test_conv2d_int16_kernel_reference_case",
+  "expected_dtype": "int16"
+}

@@ -1,0 +1,14 @@
+[run]
+source = aimet_torch/fixed_point
+branch = false
+omit =
+    */e2e/imagenet_eval.py
+
+[report]
+fail_under = 85
+precision = 1
+show_missing = true
+skip_covered = true
+
+[html]
+directory = reports/coverage_html

@@ -1,0 +1,34 @@
+{
+  "model": "fixed_point_quality",
+  "updated_at": "2026-05-20",
+  "metrics": {
+    "fp32_qdq_vs_fp16_qdq": {
+      "cosine_similarity_min": 0.9999
+    },
+    "fp32_qdq_vs_fixed_scale_qdq": {
+      "cosine_similarity_min": 0.9998
+    },
+    "fp32_qdq_vs_int16_fixed_eval": {
+      "cosine_similarity_min": 0.9998,
+      "max_error_lsb_max": 1.0
+    }
+  },
+  "quality_report": {
+    "mobilenet_v2": {
+      "int16_vs_fp32_qdq_cosine_min": 0.99,
+      "fp16_vs_fp32_qdq_cosine_min": 0.999,
+      "fixed_scale_vs_fp32_qdq_cosine_min": 0.9998
+    },
+    "mobilenet_v2_ptq_qat": {
+      "mock_vanilla_cosine_min": 0.99,
+      "mock_qat_cosine_min": 0.99,
+      "mock_qat_status": "PASS",
+      "mock_combined_fallback_cosine_min": 0.99
+    },
+    "int16_single_op": {
+      "Linear → Softmax (PWL exp)": { "min_cosine": 0.999 },
+      "Linear → Tanh (PWL)": { "min_cosine": 0.9994 },
+      "Linear → GELU → Linear (PWL)": { "min_cosine": 0.97 }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# Development / CI dependencies for fixed-point regression (spec 13–14).
+-r requirements.txt
+
+pytest>=7.0
+coverage>=7.0
+onnxscript>=0.1.0
+torchvision>=0.14.0
+packaging>=21.0

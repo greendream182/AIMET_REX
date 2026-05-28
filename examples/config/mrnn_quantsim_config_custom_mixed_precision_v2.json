@@ -1,0 +1,118 @@
+{
+  "defaults":
+  {
+    "ops":
+    {
+      "is_output_quantized": "True",
+      "is_symmetric": "True"
+    },
+    "params":
+    {
+      "is_quantized": "True",
+      "is_symmetric": "True"
+    },
+    "strict_symmetric": "False",
+    "per_channel_quantization": "True"
+  },
+
+  "params":
+  {
+    "bias":
+    {
+      "is_quantized": "True"
+    }
+  },
+
+  "op_type": {
+    "Conv": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "ConvTranspose": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Gemm": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True",
+      "per_channel_quantization": "True"
+    },
+    "MatMul": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Add": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Mul": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Sub": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Div": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Floor": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Pow": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Sqrt": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "ReduceMean": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Sigmoid": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Tanh": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Pad": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Abs": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Sign": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Clip": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Sin": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Cos": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    },
+    "Gelu": {
+      "is_input_quantized": "True",
+      "is_output_quantized": "True"
+    }
+  },
+  "supergroups": [],
+
+  "model_input": {},
+
+  "model_output": {}
+}

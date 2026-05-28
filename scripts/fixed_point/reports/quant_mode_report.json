@@ -1,0 +1,35 @@
+{
+  "modes": [
+    "fp32_qdq",
+    "fp16_qdq",
+    "fixed_scale_qdq",
+    "int16_fixed_eval"
+  ],
+  "pairwise": {
+    "fp32_qdq_vs_fp16_qdq": {
+      "max_abs_error": 0.0,
+      "rmse": 0.0,
+      "cosine_similarity": 0.9999999403953552,
+      "sqnr_db": Infinity
+    },
+    "fp32_qdq_vs_fixed_scale_qdq": {
+      "max_abs_error": 0.0,
+      "rmse": 0.0,
+      "cosine_similarity": 0.9999999403953552,
+      "sqnr_db": Infinity
+    },
+    "fp32_qdq_vs_int16_fixed_eval": {
+      "max_abs_error": 0.02444136142730713,
+      "rmse": 0.01362867932766676,
+      "cosine_similarity": 0.9998943209648132,
+      "sqnr_db": 36.63554171606443,
+      "max_error_lsb": 0.0,
+      "max_error_lsb_float": 0.4888272285461426
+    }
+  },
+  "model": "dual_linear",
+  "input_shape": [
+    2,
+    8
+  ]
+}
