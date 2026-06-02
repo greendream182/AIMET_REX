@@ -169,16 +169,17 @@ def quantize(
     """
     _validate_arguments(tensor, scale, qmin, qmax, block_size)
 
-    output_dtype = internal_dtype = tensor.dtype
-
-    if not _is_grid_representable(tensor.dtype, qmin, qmax):
-        msg = f"{tensor.dtype} is unable to represent quantized output of range [{qmin}, {qmax}]."
-        raise RuntimeError(msg)
+    output_dtype = tensor.dtype
+    internal_dtype = tensor.dtype
 
     if not _is_numerically_stable(internal_dtype, qmin, qmax):
         internal_dtype = torch.float32
         if not _is_numerically_stable(internal_dtype, qmin, qmax):
             internal_dtype = torch.float64
+
+    if not _is_grid_representable(internal_dtype, qmin, qmax):
+        msg = f"{internal_dtype} is unable to represent quantized output of range [{qmin}, {qmax}]."
+        raise RuntimeError(msg)
 
     orig_tensor_shape = tensor.shape
     tensor = reshape_tensor_for_blocks(tensor, scale.shape, block_size)
@@ -261,6 +262,9 @@ def quantize_dequantize(
 
     # torch.fake_quantize doesn't support zero_point_shift
     _fast_forward &= zero_point_shift == 0.0
+
+    # fp16/bf16 activations with 16-bit grids need float32 fake-quant internals.
+    _fast_forward &= _is_grid_representable(tensor.dtype, qmin, qmax)
 
     if _fast_forward:
         ret = _torch_fake_quantize(tensor, scale, offset, qmin, qmax)

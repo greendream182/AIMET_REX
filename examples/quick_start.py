@@ -18,6 +18,7 @@ AIMET 量化演示 — 标准用法
 # ============================================================================
 import os
 import math
+import functools
 import random
 import time
 import contextlib
@@ -40,6 +41,7 @@ from aimet_torch.utils_rx import (
     freeze_quantizer_parameters,
     set_train_mode_freeze_bn,
 )
+from aimet_torch.fixed_point import ExecutionMode, quant_execution_mode
 from aimet_torch.staged_quantization_utils import load_quantizer_encodings
 from aimet_torch.quantizable_batchnorm import QuantizableBatchNorm2d
 from quant_gru import QuantGRU
@@ -263,9 +265,38 @@ def build_dataloaders(root: str):
 # ============================================================================
 # 模型定义（非 AIMET 标准用法，与量化无关）
 # ============================================================================
+def _fp16_safe_forward(forward_fn):
+    """fp16_qdq 兜底：preserved stateless module 收到 fp16 输入时，cast 到 fp32 算后再 cast 回。
+
+    动机：``stateless_modules_to_preserve`` 的模块不被 v2 wrapper 接管，没有 fp16 promote；
+    而 EPS=1e-8 在 fp16 下是 subnormal（fp16 normal min ≈ 6e-5），``clamp(min=EPS)``
+    + ``sqrt`` / ``div`` 容易触发 NaN/Inf。这里只在 fp16_qdq 模式下显式升精度，FP32 / FIXED_SCALE_QDQ
+    路径完全 no-op。
+    """
+
+    @functools.wraps(forward_fn)
+    def wrapped(self, *args, **kwargs):
+        in_fp16 = any(
+            isinstance(a, torch.Tensor) and a.dtype == torch.float16 for a in args
+        )
+        if not in_fp16:
+            return forward_fn(self, *args, **kwargs)
+        promoted = tuple(
+            a.float() if isinstance(a, torch.Tensor) and a.dtype == torch.float16 else a
+            for a in args
+        )
+        out = forward_fn(self, *promoted, **kwargs)
+        if isinstance(out, torch.Tensor) and out.is_floating_point():
+            out = out.to(torch.float16)
+        return out
+
+    return wrapped
+
+
 class PowerCompress(nn.Module):
     """Power compression: sqrt(|x|) * sign(x) — trace-friendly for INT16 decompose."""
 
+    @_fp16_safe_forward
     def forward(self, x):
         return torch.mul(torch.sign(x), torch.sqrt(torch.abs(x)))
 
@@ -273,6 +304,7 @@ class PowerCompress(nn.Module):
 class HypotFun(nn.Module):
     """Hypot: sqrt(max(x^2 + y^2, EPS)) — trace-friendly; clamp 代替 +EPS 以利 INT16。"""
 
+    @_fp16_safe_forward
     def forward(self, x, y):
         sum_sq = torch.add(torch.square(x), torch.square(y))
         return torch.sqrt(torch.clamp(sum_sq, min=EPS))
@@ -285,6 +317,7 @@ class CLN(nn.Module):
         super().__init__()
         self.factor = factor
 
+    @_fp16_safe_forward
     def forward(self, x):
         mean_sq = torch.mean(torch.square(x), dim=(1, 3), keepdim=True)
         std = torch.sqrt(torch.clamp(mean_sq, min=EPS))
@@ -400,10 +433,65 @@ def evaluate(model, loader, device) -> float:
     with torch.no_grad():
         for inputs, labels in loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            preds = model(inputs).max(1).indices
+            out = model(inputs)
+            if hasattr(out, "to_float"):
+                out = out.to_float()
+            preds = out.max(1).indices
             total += labels.size(0)
             correct += preds.eq(labels).sum().item()
     return correct / total
+
+
+# 三档 QDQ 主路径：用作 quick_start 的 PTQ/QAT 多模式精度对比（设计 §10.1 / 验收口径）。
+_THREE_MODES = (
+    ExecutionMode.FP32_QDQ,
+    ExecutionMode.FP16_QDQ,
+    ExecutionMode.FIXED_SCALE_QDQ,
+)
+
+
+def evaluate_three_modes(
+    model,
+    loader,
+    device,
+    *,
+    title: str,
+    pp_threshold: float = 3.0,
+) -> dict[str, float | str]:
+    """对 fp32_qdq / fp16_qdq / fixed_scale_qdq 三档逐一评估；fp32_qdq 作为 baseline。
+
+    - try/except 包住每个模式：fp16/fixed_scale 任一挂掉只会被记成 ``"FAILED: ..."``，
+      不影响 PTQ/QAT 主流程与其它模式的评估。
+    - 自动相对 fp32_qdq 计算 ΔTop1，并按 ``< pp_threshold pp`` 阈值打 ✅/⚠️。
+    """
+
+    print("\n" + "-" * 70)
+    print(f"{title}：3 模式精度对比（验收：与 fp32_qdq 误差 < {pp_threshold:.0f} pp）")
+    print("-" * 70)
+
+    results: dict[str, float | str] = {}
+    for mode in _THREE_MODES:
+        try:
+            with quant_execution_mode(mode):
+                acc = evaluate(model, loader, device)
+            results[mode.value] = acc
+            print(f"  {mode.value:22s} {acc * 100:7.2f}%")
+        except Exception as exc:  # noqa: BLE001
+            results[mode.value] = f"FAILED: {exc}"
+            print(f"  {mode.value:22s} FAILED — {exc}")
+
+    fp_ref = results.get(ExecutionMode.FP32_QDQ.value)
+    if isinstance(fp_ref, float):
+        for mode in _THREE_MODES:
+            label = mode.value
+            if label == ExecutionMode.FP32_QDQ.value:
+                continue
+            acc = results.get(label)
+            if isinstance(acc, float):
+                delta_pp = (acc - fp_ref) * 100
+                marker = "✅" if abs(delta_pp) < pp_threshold else "⚠️"
+                print(f"  Δ({label} − fp32_qdq) = {delta_pp:+.2f} pp {marker}")
+    return results
 
 
 @contextlib.contextmanager
@@ -596,6 +684,9 @@ def main():
 
         ptq_accuracy = evaluate(sim.model, loaders["test"], DEVICE)
         print(f"PTQ 量化精度: {ptq_accuracy * 100:.2f}%")
+        # 三档主路径精度对比（fp32_qdq / fp16_qdq / fixed_scale_qdq）。
+        # 校准始终在 fp32_qdq 完成（设计 §4.2）；这里只切换 evaluate 上下文。
+        evaluate_three_modes(sim.model, loaders["test"], DEVICE, title="PTQ 后")
 
     # ------------------------------------------------------------------
     # 步骤 5: Power-of-2 量化（NPU 友好的 scale 对齐）
@@ -626,6 +717,9 @@ def main():
         qat_finetune(sim, loaders["train"], DEVICE)
         qat_accuracy = evaluate(sim.model, loaders["test"], DEVICE)
         print(f"QAT 微调后精度: {qat_accuracy * 100:.2f}%")
+        # QAT 训练在 fp32_qdq 下完成（设计 §4.2）；以下三档对比 = 训练后切 mode 评估。
+        # 用法：fp32_qdq 主考核；fixed_scale_qdq 校准 (M,r) 自动 derive；fp16_qdq experimental。
+        evaluate_three_modes(sim.model, loaders["test"], DEVICE, title="QAT 后")
 
     # ------------------------------------------------------------------
     # 步骤 7: 保存量化产物

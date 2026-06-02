@@ -128,9 +128,10 @@ class STFT(nn.Module):
             mode='constant')
         input_data = input_data.squeeze(1)
 
+        # FP16_QDQ 等路径下激活可能为 half，buffer 仍为 float32；对齐 dtype（FX 可追踪，同 dtype 时等价 no-op）。
         forward_transform = F.conv1d(
             input_data,
-            self.forward_basis,
+            self.forward_basis.to(dtype=input_data.dtype),
             stride=self.hop_length,
             padding=0)
 
@@ -164,7 +165,12 @@ class STFT(nn.Module):
         cpx_ipt = cpx_ipt.reshape(batch_size * channels, time_steps, num_freqs, 2)
         cpx_ipt = cpx_ipt.reshape(batch_size * channels, time_steps, num_freqs * 2)
         cpx_ipt = cpx_ipt.permute(0, 2, 1)
-        inverse_transform = F.conv_transpose1d(cpx_ipt, self.inverse_basis, stride=self.hop_length, padding=0)
+        inverse_transform = F.conv_transpose1d(
+            cpx_ipt,
+            self.inverse_basis.to(dtype=cpx_ipt.dtype),
+            stride=self.hop_length,
+            padding=0,
+        )
 
         if self.window is not None:
             window_sum = window_sumsquare(

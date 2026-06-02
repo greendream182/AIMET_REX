@@ -188,7 +188,6 @@ functional_with_stateful_api = {
 # Function that requires special transformation.
 functional_with_special_handling = {
     "cat": aimet_modules.Concat,
-    "conv1d": torch.nn.Conv1d,
     "conv2d": torch.nn.Conv2d,
 }
 
@@ -381,78 +380,6 @@ def conv2d_create_module(node: torch.fx.node) -> torch.nn.Module:
     return module
 
 
-def conv1d_create_node(
-    traced_model: torch.fx.GraphModule, module_name: str, node: torch.fx.node
-) -> torch.fx.node:
-    """Insert a ``call_module`` node for ``F.conv1d`` (mirrors ``conv2d_create_node``)."""
-
-    n_args = len(node.args)
-    input_tensor = []
-    for index, key in [[0, "input"], [1, "weight"], [2, "bias"]]:
-        value = None
-        if n_args > index:
-            value = node.args[index]
-        elif key in node.kwargs:
-            value = node.kwargs[key]
-
-        if value is not None:
-            input_tensor.append(value)
-        else:
-            break
-
-    with traced_model.graph.inserting_after(node):
-        if check_dynamic_conv1d(traced_model, module_name):
-            new_node = traced_model.graph.call_module(
-                module_name, args=tuple(input_tensor)
-            )
-        else:
-            new_node = traced_model.graph.call_module(
-                module_name, args=tuple([input_tensor[0]])
-            )
-        return new_node
-
-
-def check_dynamic_conv1d(traced_model: torch.fx.GraphModule, module_name: str) -> bool:
-    m = traced_model
-    for name in module_name.split("."):
-        m = getattr(m, name)
-    return isinstance(m, aimet_modules.DynamicConv1d)
-
-
-def conv1d_create_module(node: torch.fx.node) -> torch.nn.Module:
-    """Create ``nn.Conv1d`` or ``DynamicConv1d`` from an ``F.conv1d`` FX node."""
-
-    params = merge_args_and_kwargs(node, {1: "weight", 2: "bias"})
-    kwargs = merge_args_and_kwargs(
-        node, {3: "stride", 4: "padding", 5: "dilation", 6: "groups"}
-    )
-
-    use_dynamic_conv1d = False
-    for param in params.values():
-        if param.op != "get_attr":
-            use_dynamic_conv1d = True
-            break
-
-    if use_dynamic_conv1d:
-        module = aimet_modules.DynamicConv1d(**kwargs)
-    else:
-        for key, param_node in params.items():
-            params[key] = get_node_attr(param_node)
-
-        out_channels, in_channels, kernel_size = params["weight"].shape
-        bias = "bias" in params
-        kwargs["in_channels"] = in_channels * kwargs.get("groups", 1)
-        kwargs["out_channels"] = out_channels
-        kwargs["kernel_size"] = kernel_size
-        kwargs["bias"] = bias
-
-        module = torch.nn.Conv1d(**kwargs)
-        module.weight = torch.nn.Parameter(params["weight"])
-        if bias:
-            module.bias = torch.nn.Parameter(params["bias"])
-    return module
-
-
 def merge_args_and_kwargs(node: torch.fx.node, arguments_to_fetch: Dict) -> Dict:
     """
     Merge args and kwargs into a single kwargs and return it
@@ -544,7 +471,6 @@ def concat_create_module(node: torch.fx.node) -> torch.nn.Module:
 special_handler_functions = {
     # Special handling functions for creating node and module
     "cat": {"node_fn": concat_create_node, "module_fn": concat_create_module},
-    "conv1d": {"node_fn": conv1d_create_node, "module_fn": conv1d_create_module},
     "conv2d": {"node_fn": conv2d_create_node, "module_fn": conv2d_create_module},
 }
 
