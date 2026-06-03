@@ -1,0 +1,201 @@
+{
+  "description": "v2 单算子 6 FAIL 修复：sign 用 --sign-input-bypass；sqrt/square 16bit；div 用 --div-denom-input-bypass",
+  "comment": "基于 pc1_sign_sqrt_only_16bit.json，追加 square/div  wildcard；配合 int16_single_op_vs_float_native.py --bitwidth-config 使用",
+  "default_bitwidth": {
+    "weight": 8,
+    "output": 8
+  },
+  "layer_type_config": {
+    "QuantizedConv2d": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedConvTranspose2d": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedLinear": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "per_channel_quantization": true,
+      "disable_quantization": false
+    },
+    "QuantizedBatchNorm2d": {
+      "weight_bitwidth": 8,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedTanh": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSigmoid": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedAdd": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedMultiply": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSubtract": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedDivide": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedPow": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSqrt": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedMean": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedVar": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedConcat": {
+      "output_bitwidth": 8,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedAbs": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSign": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedClip": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedFloorDivide": {
+      "disable_quantization": true
+    },
+    "QuantizedPad": {
+      "disable_quantization": true
+    }
+  },
+  "layer_name_config": {
+    "_comment": "sign 勿用 16bit input（仍≈80% agreement）；脚本加 --sign-input-bypass",
+    "power_compress_1.module_sqrt*": {
+      "input_bitwidth": 16,
+      "output_bitwidth": 16,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "*.cln.module_square_*": {
+      "input_bitwidth": 16,
+      "output_bitwidth": 16,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "enc_seqs.0 square max≈376；仅 output 16bit 不足，input+output 同步提升"
+    },
+    "*.rnn2d_bn.module_div_*": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "分母 Q→0 根因；优先用 --div-denom-input-bypass，勿盲目 16bit input"
+    }
+  },
+  "GRU_config": {
+    "default_config": {
+      "disable_quantization": false
+    },
+    "operator_config": {
+      "x": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "h": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "W": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false, "quantization_granularity": "PER_TENSOR" },
+      "R": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false, "quantization_granularity": "PER_TENSOR" },
+      "bw": { "bitwidth": 16, "is_symmetric": true, "is_unsigned": false, "quantization_granularity": "PER_TENSOR" },
+      "br": { "bitwidth": 16, "is_symmetric": true, "is_unsigned": false, "quantization_granularity": "PER_TENSOR" },
+      "weight_ih_linear": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "weight_hh_linear": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "update_gate_input": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "update_gate_output": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": true },
+      "reset_gate_input": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "reset_gate_output": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": true },
+      "new_gate_input": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "new_gate_output": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "mul_reset_hidden": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "mul_old_contribution": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false },
+      "mul_new_contribution": { "bitwidth": 8, "is_symmetric": true, "is_unsigned": false }
+    }
+  },
+  "default_config": {
+    "disable_quantization": false
+  }
+}

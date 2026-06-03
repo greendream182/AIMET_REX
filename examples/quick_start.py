@@ -62,15 +62,18 @@ SEED = 42
 EPS = 1e-8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-DATA_ROOT = "/mnt/data8t/share/datasets/speech_commands/SpeechCommands/speech_commands_v0.02"
+DATA_ROOT = "/home/llq/workspace/data/speech_commands"
+if not os.path.isdir(DATA_ROOT):
+    DATA_ROOT = "/mnt/data8t/share/datasets/speech_commands/SpeechCommands/speech_commands_v0.02"
 NUM_CLASSES = 35
 BATCH_SIZE = 64
 NUM_WORKERS = 4
 
-FP_EPOCHS = 1
+FP_EPOCHS = 30
 QAT_EPOCHS = 1
-FP_LR = 1e-4
+FP_LR = 1e-3
 QAT_LR = 1e-4
+FP_LR_MIN = 1e-5
 
 # 量化方案 —— AIMET QuantizationSimModel.quant_scheme 接受以下输入：
 #   字符串别名:  "min_max" | "tf" | "tf_enhanced" | "percentile"   ("tf" 是 "min_max" 的别名)
@@ -87,6 +90,8 @@ CONFIG_FILE = _HERE / "config" / "mrnn_quantsim_config_custom_mixed_precision_v2
 BITWIDTH_CONFIG_FILE = _HERE / "config" / "quick_start_full_quant.json"
 OUTPUT_DIR = _HERE / "output" / "quick_start"
 FP_MODEL_PATH = _HERE / "model_fp.pth"
+# §2.3 CLZ encoding：sign bypass（校准前）+ reciprocal/power_2（Po2 后）
+MRNN_CLZ_ENCODING_FIX = os.environ.get("MRNN_CLZ_ENCODING_FIX", "0") == "1"
 
 
 # ============================================================================
@@ -518,10 +523,17 @@ def stage(name: str, timings: dict | None = None):
 # ============================================================================
 def train_floating_point(model, train_loader, test_loader, device,
                          epochs: int = FP_EPOCHS, lr: float = FP_LR,
-                         save_path=FP_MODEL_PATH) -> float:
-    """训练浮点模型，保存权重并返回测试精度。"""
+                         save_path=FP_MODEL_PATH,
+                         val_loader=None,
+                         lr_min: float = FP_LR_MIN) -> float:
+    """训练浮点模型；按 val Top-1 保存最优权重，返回 test Top-1。"""
     loss_fn = nn.CrossEntropyLoss()
     optim = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=max(epochs, 1), eta_min=lr_min,
+    )
+    val_loader = val_loader or test_loader
+    best_val, best_state = -1.0, None
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -534,47 +546,115 @@ def train_floating_point(model, train_loader, test_loader, device,
             loss.backward()
             optim.step()
             running_loss += loss.item()
-            pbar.set_postfix(loss=f"{running_loss / batch_idx:.4f}")
-        print(f"[FP] Epoch {epoch}/{epochs} - Loss: {running_loss / max(batch_idx, 1):.4f}")
-        torch.save(model.state_dict(), save_path)
+            pbar.set_postfix(
+                loss=f"{running_loss / batch_idx:.4f}",
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+            )
+        scheduler.step()
 
-    model.load_state_dict(torch.load(save_path, map_location=device), strict=False)
-    return evaluate(model, test_loader, device)
+        val_acc = evaluate(model, val_loader, device)
+        print(
+            f"[FP] Epoch {epoch}/{epochs} - Loss: {running_loss / max(batch_idx, 1):.4f}, "
+            f"Val: {val_acc * 100:.2f}%, LR: {scheduler.get_last_lr()[0]:.2e}"
+        )
+        if val_acc > best_val:
+            best_val = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=False)
+    torch.save(model.state_dict(), save_path)
+    test_acc = evaluate(model, test_loader, device)
+    print(f"[FP] Best val {best_val * 100:.2f}% → saved {save_path}, test {test_acc * 100:.2f}%")
+    return test_acc
 
 
-def qat_finetune(sim, train_loader, device,
-                 epochs: int = QAT_EPOCHS, lr: float = QAT_LR) -> None:
+def qat_finetune(
+    sim,
+    train_loader,
+    device,
+    *,
+    epochs: int = QAT_EPOCHS,
+    lr: float = QAT_LR,
+    val_loader=None,
+    max_batches_per_epoch: int | None = None,
+    restore_best: bool = True,
+) -> dict[str, float]:
     """
     QAT 训练循环（标准 PyTorch 训练循环 + AIMET ``set_train_mode_freeze_bn``）。
     调用前应已经通过 ``freeze_quantizer_parameters`` 冻结 quantizer / BN affine。
     """
+    from aimet_torch.fixed_point import ExecutionMode, quant_execution_mode
+
     optim = torch.optim.Adam(
         [p for p in sim.model.parameters() if p.requires_grad], lr=lr,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)
     loss_fn = nn.CrossEntropyLoss()
 
+    def _snapshot_state() -> dict:
+        snap: dict = {}
+        for k, v in sim.model.state_dict().items():
+            if isinstance(v, torch.Tensor):
+                snap[k] = v.detach().cpu().clone()
+            else:
+                snap[k] = v
+        return snap
+
+    best_val = -1.0
+    best_state: dict | None = None
+    stats: dict[str, float] = {}
+
+    if val_loader is not None and restore_best:
+        with quant_execution_mode(ExecutionMode.FP32_QDQ):
+            best_val = evaluate(sim.model, val_loader, device)
+        best_state = _snapshot_state()
+        stats["val_before_qat"] = best_val
+
     for epoch in range(1, epochs + 1):
-        # set_train_mode_freeze_bn: 对模型整体设 train()，但对 BN running stats 保持 eval
         set_train_mode_freeze_bn(sim.model)
 
         running_loss, valid = 0.0, 0
         pbar = tqdm(train_loader, desc=f"QAT Epoch {epoch}/{epochs}")
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
-            optim.zero_grad()
-            loss = loss_fn(sim.model(x), y)
-            loss.backward()
-            optim.step()
-            running_loss += loss.item()
-            valid += 1
-            pbar.set_postfix(
-                loss=f"{running_loss / valid:.4f}",
-                lr=f"{scheduler.get_last_lr()[0]:.2e}",
-            )
-        print(f"[QAT] Epoch {epoch}/{epochs} - Loss: {running_loss / max(valid, 1):.4f}, "
-              f"LR: {scheduler.get_last_lr()[0]:.2e}")
+        with quant_execution_mode(ExecutionMode.FP32_QDQ):
+            for batch_idx, (x, y) in enumerate(pbar):
+                if max_batches_per_epoch is not None and batch_idx >= max_batches_per_epoch:
+                    break
+                x, y = x.to(device), y.to(device)
+                optim.zero_grad()
+                loss = loss_fn(sim.model(x), y)
+                loss.backward()
+                optim.step()
+                running_loss += loss.item()
+                valid += 1
+                pbar.set_postfix(
+                    loss=f"{running_loss / valid:.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+        epoch_loss = running_loss / max(valid, 1)
+        stats[f"train_loss_epoch_{epoch}"] = epoch_loss
+        print(
+            f"[QAT] Epoch {epoch}/{epochs} - Loss: {epoch_loss:.4f}, "
+            f"LR: {scheduler.get_last_lr()[0]:.2e}"
+        )
+
+        if val_loader is not None:
+            with quant_execution_mode(ExecutionMode.FP32_QDQ):
+                val_acc = evaluate(sim.model, val_loader, device)
+            stats[f"val_epoch_{epoch}"] = val_acc
+            print(f"[QAT] Epoch {epoch}/{epochs} - Val Top-1: {val_acc * 100:.2f}%")
+            if restore_best and val_acc >= best_val:
+                best_val = val_acc
+                best_state = _snapshot_state()
+
         scheduler.step()
+
+    if restore_best and best_state is not None:
+        sim.model.load_state_dict(best_state, strict=False)
+        stats["val_restored"] = best_val
+        print(f"[QAT] Restored best checkpoint (val Top-1: {best_val * 100:.2f}%)")
+
+    return stats
 
 
 # ============================================================================
@@ -635,7 +715,9 @@ def main():
     # 步骤 2: 浮点训练 + 评估
     # ------------------------------------------------------------------
     with stage("步骤 2: 浮点训练 + 评估", timings):
-        fp_accuracy = train_floating_point(model, loaders["train"], loaders["test"], DEVICE)
+        fp_accuracy = train_floating_point(
+            model, loaders["train"], loaders["test"], DEVICE, val_loader=loaders["val"],
+        )
         print(f"浮点精度: {fp_accuracy * 100:.2f}%")
 
     # ------------------------------------------------------------------
@@ -667,6 +749,11 @@ def main():
         apply_mixed_precision_bitwidth(
             sim.model, config_file=str(BITWIDTH_CONFIG_FILE), verbose=True,
         )
+        if MRNN_CLZ_ENCODING_FIX:
+            from common.mrnn_clz_encoding import apply_mrnn_clz_encoding_fixes
+
+            apply_mrnn_clz_encoding_fixes(sim.model, verbose=True)
+            print("MRNN CLZ encoding fix: sign input bypass（校准前）")
 
     # ------------------------------------------------------------------
     # 步骤 4: 校准 (PTQ)
@@ -688,6 +775,14 @@ def main():
         # 校准始终在 fp32_qdq 完成（设计 §4.2）；这里只切换 evaluate 上下文。
         evaluate_three_modes(sim.model, loaders["test"], DEVICE, title="PTQ 后")
 
+    power2_float_fmax = None
+    if MRNN_CLZ_ENCODING_FIX:
+        from common.mrnn_clz_encoding import collect_power2_float_out_fmax
+
+        power2_float_fmax = collect_power2_float_out_fmax(
+            prepared_model, loaders["calib"], DEVICE, MAX_CALIB_BATCHES,
+        )
+
     # ------------------------------------------------------------------
     # 步骤 5: Power-of-2 量化（NPU 友好的 scale 对齐）
     #   把所有 scale 调整到 2^n，便于在定点硬件上用移位实现 dequant。
@@ -701,6 +796,15 @@ def main():
             align_bias_scale=True,
             verbose=True,
         )
+        if MRNN_CLZ_ENCODING_FIX:
+            from common.mrnn_clz_encoding import apply_mrnn_clz_encoding_fixes_post_calib
+
+            stats = apply_mrnn_clz_encoding_fixes_post_calib(
+                sim.model,
+                power2_float_out_fmax=power2_float_fmax,
+                verbose=True,
+            )
+            print(f"MRNN CLZ encoding fix（Po2 后）: {stats}")
         po2_accuracy = evaluate(sim.model, loaders["test"], DEVICE)
         print(f"Power-of-2 量化精度: {po2_accuracy * 100:.2f}%")
 
@@ -714,7 +818,9 @@ def main():
     # ------------------------------------------------------------------
     with stage("步骤 6: QAT 微调", timings):
         freeze_quantizer_parameters(sim.model, verbose=True, freeze_bn_affine=True)
-        qat_finetune(sim, loaders["train"], DEVICE)
+        qat_stats = qat_finetune(sim, loaders["train"], DEVICE, val_loader=loaders["val"])
+        if qat_stats.get("val_restored") is not None:
+            print(f"QAT val checkpoint: {qat_stats['val_restored'] * 100:.2f}%")
         qat_accuracy = evaluate(sim.model, loaders["test"], DEVICE)
         print(f"QAT 微调后精度: {qat_accuracy * 100:.2f}%")
         # QAT 训练在 fp32_qdq 下完成（设计 §4.2）；以下三档对比 = 训练后切 mode 评估。
