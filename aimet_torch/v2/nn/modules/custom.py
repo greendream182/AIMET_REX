@@ -177,12 +177,38 @@ class QuantizedSubtract(_DispatchMixin, QuantizationMixin, Subtract):
     _builtin_torch_fn = torch.sub
 
 
+def _safe_div(x, y, *args, **kwargs):
+    """``torch.div`` with ``0/0 -> 0`` and ``x/0 -> 0`` protection (backward-safe).
+
+    Needed for ``fixed_scale_qdq`` (and any other path where divisor activations
+    may be rounded to integer-grid zero by quantization). The fp32_qdq fake-quant
+    path empirically masks 0/0 to non-NaN through downstream effects, but
+    fixed_scale_qdq propagates exact ``0/0 -> NaN``, which then poisons the rest
+    of the forward graph (e.g. CLN ``x / sqrt(clamp(var, min=eps))`` when ``eps``
+    rounds to 0). Returning 0 there matches the implicit fp32_qdq behavior.
+
+    Implementation notes:
+      * Replace ``y`` with 1 *before* the division so ``torch.div`` never actually
+        evaluates ``0/0`` — important under autograd: the naive
+        ``where(y==0, 0, x/y)`` form still computes ``x/y`` internally and
+        ``torch.where``'s backward pass routes grad through both branches, so
+        NaN from the dead branch poisons grads during QAT.
+      * Pure tensor ops (no python-level ``if``) → tracing / TorchScript safe.
+    """
+    if not isinstance(y, torch.Tensor) or not y.is_floating_point():
+        return torch.div(x, y, *args, **kwargs)
+    zero_mask = (y == 0)
+    safe_y = torch.where(zero_mask, torch.ones_like(y), y)
+    out = torch.div(x, safe_y, *args, **kwargs)
+    return torch.where(zero_mask, torch.zeros_like(out), out)
+
+
 @QuantizationMixin.implements(Divide)
 class QuantizedDivide(_DispatchMixin, QuantizationMixin, Divide):
     """Quantized Divide"""
 
     __quant_init__ = QuantizationMixin.__binary__
-    _builtin_torch_fn = torch.div
+    _builtin_torch_fn = _safe_div
 
 
 @QuantizationMixin.implements(Outer)

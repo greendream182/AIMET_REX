@@ -995,7 +995,12 @@ def apply_mixed_precision_bitwidth(sim_model, config_file: str, verbose: bool = 
     default_config = config.get('default_config', {})  # 读取 default_config 字段
     layer_type_config = config.get('layer_type_config', {})
     layer_name_config = config.get('layer_name_config', {})
-    
+    # opt-in：让 layer_name_config 中的通配 pattern 优先于 layer_type_config。
+    # 老 config 默认 false（精确 name > type > pattern），与历史行为保持一致；
+    # 新 config 写显式 module-tree wildcard（如 "power_compress_1.*"）想覆盖
+    # 默认 type 配置时，设为 true，避免被 QuantizedAbs/Sqrt/... 这类 type 默认值覆盖。
+    pattern_priority = bool(config.get('pattern_priority', False))
+
     # 过滤掉注释字段
     layer_name_config = {k: v for k, v in layer_name_config.items() 
                         if not k.startswith('_') and k not in ['examples', 'comment']}
@@ -1013,6 +1018,9 @@ def apply_mixed_precision_bitwidth(sim_model, config_file: str, verbose: bool = 
             print(f"📝 默认策略: 禁用所有未匹配层的量化")
         print(f"📝 类型配置数量: {len(layer_type_config)} 个层类型")
         print(f"📝 名称配置数量: {len(layer_name_config)} 个具体层")
+        print(f"📝 匹配优先级: 精确 name > "
+              f"{'pattern > type' if pattern_priority else 'type > pattern'}"
+              f" (pattern_priority={pattern_priority})")
         print("="*70)
     
     # 统计信息
@@ -1036,6 +1044,12 @@ def apply_mixed_precision_bitwidth(sim_model, config_file: str, verbose: bool = 
     except ImportError:
         _QuantGRUType = None
 
+    def _match_pattern_config(name_to_match):
+        for pattern, cfg in layer_name_config.items():
+            if '*' in pattern and fnmatch.fnmatch(name_to_match, pattern):
+                return pattern, cfg
+        return None, None
+
     # 遍历所有模块
     for name, module in sim_model.named_modules():
         module_type = type(module).__name__
@@ -1047,34 +1061,43 @@ def apply_mixed_precision_bitwidth(sim_model, config_file: str, verbose: bool = 
             continue
 
         # 确定使用哪个配置
-        # 优先级：精确名称 > 类型 > 模式匹配 > 默认
+        # 默认优先级：精确 name > 类型 > 模式匹配 > 默认
         #   类型 > 模式：避免宽泛通配符（如 *.act*）意外覆盖子模块的类型配置；
         #   模式匹配保留在类型之后，专门用于无类型配置的父 Module（如 Snake2d 包装层的 alpha）。
+        # 当 config 顶层设置 `pattern_priority: true` 时，pattern 优先于 type，
+        # 用于显式 module-tree wildcard 覆盖 type 默认（如 frontend 数学链整段升 16bit）。
         layer_config = None
         match_type = None
         matched_pattern = None
 
-        # 1. 尝试按名称精确匹配
+        # 1. 尝试按名称精确匹配（始终最高优先级）
         if name in layer_name_config:
             layer_config = layer_name_config[name]
             match_type = 'name'
             stats['name_matched_count'] += 1
 
-        # 2. 尝试按类型匹配（优先于通配符模式，避免宽泛模式意外覆盖）
-        if layer_config is None and module_type in layer_type_config:
-            layer_config = layer_type_config[module_type]
-            match_type = 'type'
-            stats['type_matched_count'] += 1
-
-        # 3. 尝试按模式匹配（支持通配符 *，仅在无类型配置时生效）
         if layer_config is None:
-            for pattern, config in layer_name_config.items():
-                if '*' in pattern and fnmatch.fnmatch(name, pattern):
-                    layer_config = config
+            if pattern_priority:
+                # 1a. pattern 优先
+                matched_pattern, layer_config = _match_pattern_config(name)
+                if layer_config is not None:
                     match_type = 'pattern'
-                    matched_pattern = pattern
                     stats['name_matched_count'] += 1
-                    break
+                elif module_type in layer_type_config:
+                    layer_config = layer_type_config[module_type]
+                    match_type = 'type'
+                    stats['type_matched_count'] += 1
+            else:
+                # 1b. 历史默认：type 优先
+                if module_type in layer_type_config:
+                    layer_config = layer_type_config[module_type]
+                    match_type = 'type'
+                    stats['type_matched_count'] += 1
+                else:
+                    matched_pattern, layer_config = _match_pattern_config(name)
+                    if layer_config is not None:
+                        match_type = 'pattern'
+                        stats['name_matched_count'] += 1
 
         # 4. 对于未匹配的模块，检查是否需要禁用量化
         if layer_config is None:
