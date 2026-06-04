@@ -366,6 +366,13 @@ class LogInt16Kernel(_LutInt16Kernel):
     module_type = custom.Log
 
 
+@register_fixed_kernel(custom.Abs)
+class AbsInt16Kernel(_LutInt16Kernel):
+    """INT16 PWL kernel for ``custom.Abs`` (PowerCompress / frontend)."""
+
+    module_type = custom.Abs
+
+
 @register_fixed_kernel(nn.Softmax)
 class SoftmaxInt16Kernel:
     """INT16 Softmax: PWL ``exp`` + integer sum (default), or legacy float reference."""

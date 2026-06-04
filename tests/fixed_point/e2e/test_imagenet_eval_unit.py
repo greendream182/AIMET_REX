@@ -45,6 +45,9 @@ def test_resolve_imagenet_val_dir_from_env(tmp_path, monkeypatch):
 
 def test_resolve_imagenet_val_dir_missing(monkeypatch):
     monkeypatch.delenv(IMAGENET_VAL_ENV, raising=False)
+    import aimet_torch.fixed_point.e2e.imagenet_eval as imagenet_eval
+
+    monkeypatch.setattr(imagenet_eval, "_imagenet_val_fallback_candidates", lambda: [])
     assert resolve_imagenet_val_dir() is None
 
 

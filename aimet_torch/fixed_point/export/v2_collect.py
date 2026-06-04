@@ -163,7 +163,7 @@ def derive_int16_real_multiplier(
         return None
     y_scale = y_enc.scale.to(device=dev, dtype=torch.float32)
 
-    if base_cls is custom.Multiply and len(qmodule.input_quantizers) >= 2:
+    if base_cls in (custom.Multiply, custom.Divide) and len(qmodule.input_quantizers) >= 2:
         scales = []
         for iq in qmodule.input_quantizers[:2]:
             if not isinstance(iq, QuantizerBase) or not iq.is_initialized():
@@ -172,8 +172,9 @@ def derive_int16_real_multiplier(
             if not isinstance(enc, AffineEncoding):
                 return None
             scales.append(enc.scale.to(device=dev, dtype=torch.float32))
-        prod_scale = scales[0] * scales[1]
-        return prod_scale / y_scale
+        if base_cls is custom.Multiply:
+            return (scales[0] * scales[1]) / y_scale
+        return scales[0] / scales[1] / y_scale
 
     return x_scale / y_scale
 

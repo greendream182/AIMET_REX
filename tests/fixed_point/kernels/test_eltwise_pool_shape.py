@@ -37,6 +37,36 @@ def test_relu_int16_kernel_clamps_to_zero_point():
     assert output.int_repr.tolist() == [0, 0, 3]
 
 
+def test_add_align_preserves_negative_centered_values_for_asymmetric_output():
+    """Scale alignment must not clip centered negatives to output qmin (MobileNet residual)."""
+
+    out_scale = 0.00022886419901624322
+    out_zp = 134
+    out_enc = OutputEncoding(
+        scale=torch.tensor(out_scale, dtype=torch.float32),
+        zero_point=torch.tensor(out_zp, dtype=torch.int32),
+        qmin=0,
+        qmax=255,
+        multiplier=torch.tensor(32767, dtype=torch.int16),
+        rshift=torch.tensor(15, dtype=torch.int8),
+    )
+    main = _int16_tensor(
+        [[120, 80, 60]],
+        scale=0.00024029603810049593,
+        zero_point=0,
+    )
+    residual = _int16_tensor(
+        [[-20, -40, 10]],
+        scale=1.0082941116706934e-05,
+        zero_point=0,
+    )
+    ref = main.to_float() + residual.to_float()
+    output = get_fixed_kernel(custom.Add)([main, residual], {}, out_enc, {})
+    got = output.to_float()
+    cos = torch.dot(ref.flatten(), got.flatten()) / (ref.norm() * got.norm() + 1e-30)
+    assert cos.item() >= 0.999
+
+
 def test_maxpool2d_int16_kernel():
     x = _int16_tensor([[[[1, 2], [3, 4]]]])
     output = get_fixed_kernel(nn.MaxPool2d)(

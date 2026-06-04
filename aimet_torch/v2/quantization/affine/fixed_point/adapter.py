@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -108,6 +110,31 @@ def _is_weighted_module(base_cls: type) -> bool:
     return base_cls in (nn.Linear, nn.Conv1d, nn.Conv2d)
 
 
+# INT16 kernels that only need output scale/zp/qmin/qmax (no MAC ``M,rshift``).
+_UNARY_GRID_ONLY_OUTPUT_OPS = frozenset(
+    {
+        custom.ElementwiseUnarySign,
+        custom.Abs,
+    }
+)
+
+
+def _output_encoding_from_scales(
+    y_enc: AffineEncoding,
+    real_multiplier: torch.Tensor,
+    device: torch.device,
+    *,
+    base_cls: type,
+) -> OutputEncoding:
+    """Build :class:`OutputEncoding`; skip ``quantize_multiplier`` when not needed."""
+
+    if base_cls in _UNARY_GRID_ONLY_OUTPUT_OPS:
+        return _affine_to_fixed_encoding(y_enc, device)
+    if not torch.isfinite(real_multiplier).all():
+        return _affine_to_fixed_encoding(y_enc, device)
+    return _affine_output_encoding(y_enc, real_multiplier, device)
+
+
 def _resolve_adaptive_avg_pool2d_output_size(
     args: tuple,
     kwargs: dict,
@@ -194,6 +221,8 @@ def _pwl_activation_fn(module: nn.Module, base_cls: type):
         return torch.exp
     if base_cls is custom.Log:
         return torch.log
+    if base_cls is custom.Abs:
+        return torch.abs
     return None
 
 
@@ -234,6 +263,16 @@ def _qat_surrogate_float(
         return surrogate_inputs[0] - surrogate_inputs[1]
     if base_cls is custom.Multiply and len(surrogate_inputs) == 2:
         return surrogate_inputs[0] * surrogate_inputs[1]
+    if base_cls is custom.MatMul and len(surrogate_inputs) == 2:
+        return torch.matmul(surrogate_inputs[0], surrogate_inputs[1])
+    if base_cls is custom.Divide and len(surrogate_inputs) == 2:
+        num, den = surrogate_inputs
+        eps = float(extra.get("eps", 1e-12))
+        return num / torch.where(
+            den.abs() < eps,
+            eps * den.sign().clamp(min=1.0),
+            den,
+        )
     if base_cls is nn.ReLU:
         return F.relu(surrogate_inputs[0])
     if base_cls is nn.ReLU6:
@@ -290,11 +329,58 @@ def _qat_surrogate_float(
         return torch.cos(surrogate_inputs[0])
     if base_cls is custom.Square:
         return torch.square(surrogate_inputs[0])
+    if base_cls is custom.Sqrt:
+        return torch.sqrt(surrogate_inputs[0].clamp_min(0.0))
+    if base_cls is custom.RSqrt:
+        return torch.rsqrt(surrogate_inputs[0].clamp_min(0.0))
+    if base_cls is custom.ElementwiseUnarySign:
+        return torch.sign(surrogate_inputs[0])
     pwl_fn = _pwl_activation_fn(qmodule, base_cls)
     if pwl_fn is not None:
         return pwl_fn(surrogate_inputs[0])
     del params
     return None
+
+
+def _qat_surrogate_checkpoint_enabled() -> bool:
+    """Activation-checkpoint surrogate ops during INT16 QAT when explicitly enabled."""
+
+    if not torch.is_grad_enabled():
+        return False
+    return os.environ.get("AIMET_RX_QAT_SURROGATE_CHECKPOINT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _run_qat_surrogate(
+    qmodule: nn.Module,
+    base_cls: type,
+    surrogate_inputs: list[torch.Tensor],
+    params: Dict[str, Any],
+    extra: Dict[str, Any],
+) -> Optional[torch.Tensor]:
+    """Run float surrogate for STE; optionally checkpoint to save activation memory."""
+
+    if not surrogate_inputs:
+        return None
+    if not _qat_surrogate_checkpoint_enabled():
+        return _qat_surrogate_float(qmodule, base_cls, surrogate_inputs, params, extra)
+
+    def _checkpointed(*flat_inputs: torch.Tensor) -> torch.Tensor:
+        result = _qat_surrogate_float(qmodule, base_cls, list(flat_inputs), params, extra)
+        if result is None:
+            raise RuntimeError(
+                f"QAT surrogate checkpoint failed for {getattr(base_cls, '__name__', base_cls)!r}."
+            )
+        return result
+
+    return torch.utils.checkpoint.checkpoint(
+        _checkpointed,
+        *surrogate_inputs,
+        use_reentrant=False,
+    )
 
 
 def _broadcast_output_encoding_linear(enc: OutputEncoding, out_features: int) -> OutputEncoding:
@@ -347,6 +433,69 @@ def _broadcast_output_encoding_conv2d(enc: OutputEncoding, out_channels: int) ->
         rshift=rsh.reshape(1, out_channels, 1, 1),
         axis=enc.axis,
     )
+
+
+def _resolve_sign_float_input(
+    arg: Any,
+    int_value_ctx: contextlib.AbstractContextManager,
+) -> Optional[torch.Tensor]:
+    if isinstance(arg, Int16QuantizedTensor):
+        with int_value_ctx:
+            return arg.to_float(torch.float32)
+    return _unwrap_float_tensor(arg)
+
+
+def _dispatch_sign_int16_on_float(
+    qmodule: nn.Module,
+    args: tuple,
+    kwargs: dict,
+    *,
+    device: torch.device,
+    mode: ExecutionMode,
+    collect_surrogate: bool,
+    int_value_ctx: contextlib.AbstractContextManager,
+) -> Optional[Union[Int16QuantizedTensor, torch.Tensor]]:
+    """Run sign on float input before input-grid collapse (CLZ / STFT near-zero)."""
+
+    oq_list = getattr(qmodule, "output_quantizers", None)
+    oq = oq_list[0] if oq_list else None
+    if not isinstance(oq, QuantizerBase) or not oq.is_initialized():
+        return None
+    y_enc = oq.get_encodings()
+    if not isinstance(y_enc, AffineEncoding):
+        return None
+
+    float_in = _resolve_sign_float_input(args[0], int_value_ctx)
+    if float_in is None:
+        return None
+    float_in = float_in.to(device=device)
+
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.fixed_point.kernels.eltwise import sign_int16_from_float_input
+
+    out_enc = _affine_to_fixed_encoding(y_enc, device)
+    with int_value_ctx:
+        out = sign_int16_from_float_input(float_in, out_enc)
+
+    if mode == ExecutionMode.INT16_FIXED_QAT_SIM:
+        surrogate = _run_qat_surrogate(
+            qmodule,
+            custom.ElementwiseUnarySign,
+            [float_in],
+            {},
+            {},
+        )
+        if surrogate is None:
+            with int_value_ctx:
+                float_out = out.to_float(torch.float32)
+            publish_int16_carrier(float_out, out)
+            return float_out
+        with int_value_ctx:
+            fixed_float = out.to_float(torch.float32)
+        ste_out = fixed_float + (surrogate - surrogate.detach())
+        publish_int16_carrier(ste_out, out)
+        return ste_out
+    return out
 
 
 def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[Int16QuantizedTensor, torch.Tensor]]:
@@ -410,6 +559,9 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
     if not args:
         return None
 
+    collect_surrogate = mode is ExecutionMode.INT16_FIXED_QAT_SIM
+    int_value_ctx = torch.no_grad() if collect_surrogate else contextlib.nullcontext()
+
     first_arg = args[0]
     first_float = _unwrap_float_tensor(first_arg)
     if isinstance(first_arg, Int16QuantizedTensor):
@@ -419,6 +571,19 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
     else:
         return None
 
+    if base_cls is custom.ElementwiseUnarySign:
+        sign_out = _dispatch_sign_int16_on_float(
+            qmodule,
+            args,
+            kwargs,
+            device=device,
+            mode=mode,
+            collect_surrogate=collect_surrogate,
+            int_value_ctx=int_value_ctx,
+        )
+        if sign_out is not None:
+            return sign_out
+
     pq = getattr(qmodule, "param_quantizers", None)
     wq = pq["weight"] if pq is not None and "weight" in pq else None
     oq = qmodule.output_quantizers[0] if qmodule.output_quantizers else None
@@ -426,7 +591,6 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
     inputs_int = []
     x_encodings = []
     surrogate_inputs = []
-    collect_surrogate = mode is ExecutionMode.INT16_FIXED_QAT_SIM
     if base_cls is custom.Concat:
         input_args = args
     else:
@@ -437,7 +601,8 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             inputs_int.append(arg)
             x_encodings.append(None)
             if collect_surrogate:
-                surrogate_inputs.append(arg.to_float())
+                with int_value_ctx:
+                    surrogate_inputs.append(arg.to_float())
             continue
         input_tensor = _unwrap_float_tensor(arg)
         quant_index = 0 if base_cls is custom.Concat else index
@@ -448,14 +613,16 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             x_enc = iq.get_encodings()
             if not isinstance(x_enc, AffineEncoding):
                 return None
-            inputs_int.append(quantize_boundary_from_affine(input_tensor, x_enc).to(device))
+            with int_value_ctx:
+                inputs_int.append(quantize_boundary_from_affine(input_tensor, x_enc).to(device))
             x_encodings.append(x_enc)
             if collect_surrogate:
                 surrogate_inputs.append(input_tensor)
             continue
         carrier = maybe_int16_carrier(arg)
         if carrier is not None:
-            inputs_int.append(carrier.to(device))
+            with int_value_ctx:
+                inputs_int.append(carrier.to(device))
             x_encodings.append(None)
             if collect_surrogate:
                 surrogate_inputs.append(input_tensor)
@@ -523,7 +690,7 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                         "ceil_mode": qmodule.ceil_mode,
                     }
                 )
-            surrogate = _qat_surrogate_float(
+            surrogate = _run_qat_surrogate(
                 qmodule, base_cls, surrogate_inputs, {}, qat_extra
             )
             if surrogate is not None:
@@ -553,18 +720,21 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
 
     if _is_weighted_module(base_cls):
         w_float = qmodule.weight
-        w_int = quantize_boundary_from_affine(w_float, w_enc).to(device)
-        params["weight"] = w_int
-        bias = getattr(qmodule, "bias", None)
-        if bias is not None:
-            if hasattr(qmodule, "_derive_bias_scale"):
-                acc_scale = qmodule._derive_bias_scale(x_scale, w_enc.scale)
-                if acc_scale is None:
-                    return None
-                ones = torch.ones_like(acc_scale, dtype=acc_scale.dtype, device=acc_scale.device)
-                params["bias"] = quantize_bias_int32(bias, acc_scale, ones)
-            else:
-                params["bias"] = quantize_bias_int32(bias, x_scale, w_enc.scale)
+        with int_value_ctx:
+            w_int = quantize_boundary_from_affine(w_float, w_enc).to(device)
+            params["weight"] = w_int
+            bias = getattr(qmodule, "bias", None)
+            if bias is not None:
+                if hasattr(qmodule, "_derive_bias_scale"):
+                    acc_scale = qmodule._derive_bias_scale(x_scale, w_enc.scale)
+                    if acc_scale is None:
+                        return None
+                    ones = torch.ones_like(
+                        acc_scale, dtype=acc_scale.dtype, device=acc_scale.device
+                    )
+                    params["bias"] = quantize_bias_int32(bias, acc_scale, ones)
+                else:
+                    params["bias"] = quantize_bias_int32(bias, x_scale, w_enc.scale)
 
         w_scale = w_enc.scale.to(device=device, dtype=torch.float32)
         y_scale = y_enc.scale.to(device=device, dtype=torch.float32)
@@ -586,6 +756,11 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             real_m = (
                 inputs_int[0].scale.to(device=device, dtype=torch.float32)
                 * inputs_int[1].scale.to(device=device, dtype=torch.float32)
+            ) / y_scale
+        elif base_cls is custom.Divide and len(inputs_int) == 2:
+            real_m = (
+                inputs_int[0].scale.to(device=device, dtype=torch.float32)
+                / inputs_int[1].scale.to(device=device, dtype=torch.float32)
             ) / y_scale
         elif base_cls is nn.AvgPool2d:
             kernel_size = qmodule.kernel_size
@@ -627,7 +802,9 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             real_m = x_scale / (float(reduce_size) * y_scale)
         else:
             real_m = x_scale / y_scale
-        out_enc = _affine_output_encoding(y_enc, real_m, device)
+        out_enc = _output_encoding_from_scales(
+            y_enc, real_m, device, base_cls=base_cls
+        )
 
     extra: Dict[str, Any]
     if isinstance(qmodule, nn.Conv2d):
@@ -705,12 +882,18 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                 extra["dim"] = kwargs.get("dim", -1)
 
     from aimet_torch.fixed_point.export.sidecar_loader import (  # noqa: WPS433
+        get_int16_online_extra,
         get_int16_sidecar_extra,
+        merge_int16_online_extra,
     )
 
     sidecar_extra = get_int16_sidecar_extra(qmodule)
     if sidecar_extra:
         extra.update(sidecar_extra)
+    online_extra = get_int16_online_extra(qmodule, device=device)
+    if online_extra:
+        for key, value in online_extra.items():
+            extra.setdefault(key, value)
 
     clz_name = clz_activation_name(base_cls)
     periodic_fit_fn, phase_fold = periodic_lut_fit_spec(base_cls)
@@ -747,6 +930,10 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                 extra["clz_lut"] = clz_body
                 extra["clz_func_name"] = clz_name
                 extra["clz_lut_metrics"] = clz_metrics
+                merge_int16_online_extra(
+                    qmodule,
+                    {"clz_lut": clz_body, "clz_func_name": clz_name},
+                )
             except ClzLutGenerationError as exc:
                 import os
 
@@ -795,15 +982,26 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                 extra["pwl_lut"] = bake_op_scale_adapter_into_pwl_lut(
                     extra["pwl_lut"], op_enc, fit_enc
                 )
+            merge_int16_online_extra(
+                qmodule,
+                {
+                    "pwl_lut": extra["pwl_lut"],
+                    "pwl_input_encoding": extra.get("pwl_input_encoding"),
+                    "phase_fold": extra.get("phase_fold"),
+                },
+            )
 
-    out = kernel(inputs_int, params, out_enc, extra)
+    with int_value_ctx:
+        out = kernel(inputs_int, params, out_enc, extra)
     if mode == ExecutionMode.INT16_FIXED_QAT_SIM:
-        surrogate = _qat_surrogate_float(qmodule, base_cls, surrogate_inputs, params, extra)
+        surrogate = _run_qat_surrogate(qmodule, base_cls, surrogate_inputs, params, extra)
         if surrogate is None:
-            float_out = out.to_float(torch.float32)
+            with int_value_ctx:
+                float_out = out.to_float(torch.float32)
             publish_int16_carrier(float_out, out)
             return float_out
-        fixed_float = out.to_float(torch.float32)
+        with int_value_ctx:
+            fixed_float = out.to_float(torch.float32)
         ste_out = fixed_float + (surrogate - surrogate.detach())
         publish_int16_carrier(ste_out, out)
         return ste_out

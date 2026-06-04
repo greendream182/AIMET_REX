@@ -27,6 +27,8 @@ from aimet_torch.fixed_point.requantize import (
     int32_mul_sat,
     int32_sub_sat,
     requantize_int,
+    round_shift,
+    saturate_int32,
     saturate_mac_accumulator,
     saturate_sim_tensor,
 )
@@ -61,13 +63,19 @@ def align_centered_int32_to_output(
     rounding = (
         RoundingMode.HALF_UP if hw_ref_mode_enabled() else RoundingMode.HALF_TO_EVEN
     )
+    # ``requantize_int`` saturates the *centered* accumulator (target zp = 0).
+    # Do not pass the output quant grid ``[qmin, qmax]`` here: for asymmetric
+    # quantizers (e.g. uint8 0..255 with zp>0) that would clip negative centered
+    # values to 0 and break Add/Concat scale alignment on residual branches.
+    centered_qmin = int(output_encoding.qmin) - output_zp.to(torch.int64)
+    centered_qmax = int(output_encoding.qmax) - output_zp.to(torch.int64)
     aligned = requantize_int(
         _center_tensor(tensor),
         multiplier.to(device=tensor.int_repr.device),
         rshift.to(device=tensor.int_repr.device),
         torch.zeros_like(output_zp, dtype=torch.int32),
-        output_encoding.qmin,
-        output_encoding.qmax,
+        int(centered_qmin.min().item()),
+        int(centered_qmax.max().item()),
         rounding_mode=rounding,
     )
     return aligned.to(torch.int32)
@@ -253,7 +261,7 @@ class ReLU6Int16Kernel(ReLUInt16Kernel):
 
 @register_fixed_kernel(nn.Hardtanh)
 class ClampInt16Kernel:
-    """Reference INT16 clamp-like kernel."""
+    """Reference INT16 clamp: dequant → float clamp → output requant."""
 
     module_type = nn.Hardtanh
 
@@ -267,10 +275,14 @@ class ClampInt16Kernel:
         del params
         if len(inputs) != 1:
             raise ValueError(f"Clamp expects 1 input; got {len(inputs)}.")
-        min_int = extra.get("min_int", output_encoding.qmin)
-        max_int = extra.get("max_int", output_encoding.qmax)
-        clamped = torch.clamp(inputs[0].int_repr, int(min_int), int(max_int))
-        return _wrap_like_output(clamped, output_encoding)
+        value = _dequant_float(inputs[0])
+        min_v = extra.get("min")
+        max_v = extra.get("max")
+        if min_v is not None:
+            value = torch.clamp(value, min=float(min_v))
+        if max_v is not None:
+            value = torch.clamp(value, max=float(max_v))
+        return _quantize_from_float(value, output_encoding)
 
 
 @register_fixed_kernel(custom.Clamp)
@@ -285,6 +297,15 @@ def _dequant_float(tensor: Int16QuantizedTensor) -> torch.Tensor:
     while scale.ndim < tensor.int_repr.ndim:
         scale = scale.unsqueeze(-1)
     return tensor.centered_int32().to(torch.float32) * scale
+
+
+def sign_int16_from_float_input(
+    float_input: torch.Tensor,
+    output_encoding: OutputEncoding,
+) -> Int16QuantizedTensor:
+    """``sign(float)`` then output requant — matches float_native / QDQ sign_input_bypass."""
+
+    return _quantize_from_float(torch.sign(float_input), output_encoding)
 
 
 def _quantize_from_float(
@@ -322,31 +343,67 @@ class _UnaryFloatRefKernel:
         return _quantize_from_float(self._apply(_dequant_float(inputs[0])), output_encoding)
 
 
-@register_fixed_kernel(custom.Abs)
-class AbsInt16Kernel(_UnaryFloatRefKernel):
-    """Reference INT16 Abs kernel."""
-
-    module_type = custom.Abs
-    op_name = "Abs"
-
-    def _apply(self, value: torch.Tensor) -> torch.Tensor:
-        return value.abs()
-
-
 @register_fixed_kernel(custom.ElementwiseUnarySign)
-class SignInt16Kernel(_UnaryFloatRefKernel):
-    """Reference INT16 sign kernel."""
+class SignInt16Kernel:
+    """INT16 sign on dequantized float (then output requant).
+
+    Sign must not run on pre-quantized centered integers: small STFT/complex
+    values collapse to zero on the input grid and flip signs (MRNN pc1).
+    """
 
     module_type = custom.ElementwiseUnarySign
-    op_name = "Sign"
 
-    def _apply(self, value: torch.Tensor) -> torch.Tensor:
-        return value.sign()
+    def __call__(
+        self,
+        inputs: List[Int16QuantizedTensor],
+        params: Dict[str, Any],
+        output_encoding: OutputEncoding,
+        extra: Dict[str, Any],
+    ) -> Int16QuantizedTensor:
+        del params, extra
+        if len(inputs) != 1:
+            raise ValueError(f"Sign expects 1 input; got {len(inputs)}.")
+        return sign_int16_from_float_input(_dequant_float(inputs[0]), output_encoding)
+
+
+def _divide_rounding_mode() -> RoundingMode:
+    return RoundingMode.HALF_UP if hw_ref_mode_enabled() else RoundingMode.HALF_TO_EVEN
+
+
+def _safe_divide_denominator(
+    den_centered: torch.Tensor,
+    den_scale: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Clamp near-zero divisors (matches float ``Divide`` reference)."""
+
+    scale_f = float(den_scale.detach().reshape(-1)[0].item())
+    min_abs = max(1, int(round(eps / max(scale_f, 1e-30))))
+    min_abs_t = torch.tensor(min_abs, device=den_centered.device, dtype=torch.int32)
+    abs_d = den_centered.abs()
+    sign_d = torch.sign(den_centered.to(torch.float32)).to(torch.int32)
+    sign_d = torch.where(sign_d == 0, torch.ones_like(sign_d), sign_d)
+    return sign_d * torch.maximum(abs_d, min_abs_t)
+
+
+def _integer_div_round(
+    num: torch.Tensor,
+    den: torch.Tensor,
+    rounding_mode: RoundingMode,
+) -> torch.Tensor:
+    num_i64 = num.to(torch.int64)
+    den_i64 = den.to(torch.int64)
+    if rounding_mode == RoundingMode.TRUNCATE:
+        return num_i64 // den_i64
+    half = den_i64.abs() // 2
+    bias = torch.where(num_i64 >= 0, half, -half)
+    return (num_i64 + bias) // den_i64
 
 
 @register_fixed_kernel(custom.Divide)
 class DivideInt16Kernel:
-    """Reference INT16 Divide kernel (float reference path for BN / normalize)."""
+    """INT16 Divide: scale numerator, integer division, output requant."""
 
     module_type = custom.Divide
 
@@ -357,14 +414,32 @@ class DivideInt16Kernel:
         output_encoding: OutputEncoding,
         extra: Dict[str, Any],
     ) -> Int16QuantizedTensor:
-        del params, extra
+        del params
         if len(inputs) != 2:
             raise ValueError(f"Divide expects 2 inputs; got {len(inputs)}.")
-        num = _dequant_float(inputs[0])
-        den = _dequant_float(inputs[1])
-        eps = torch.tensor(1e-12, device=den.device, dtype=den.dtype)
-        out = num / torch.where(den.abs() < eps, eps * den.sign().clamp(min=1.0), den)
-        return _quantize_from_float(out, output_encoding)
+        eps = float(extra.get("eps", 1e-12))
+        num_c = _center_tensor(inputs[0])
+        den_c = _center_tensor(inputs[1])
+        s_num = inputs[0].scale.to(device=num_c.device, dtype=torch.float32)
+        s_den = inputs[1].scale.to(device=num_c.device, dtype=torch.float32)
+        s_out = output_encoding.scale.to(device=num_c.device, dtype=torch.float32)
+        real_m = (s_num / s_den / s_out).detach()
+        multiplier, rshift = quantize_multiplier(real_m)
+        rounding = _divide_rounding_mode()
+        prod = num_c.to(torch.int64) * multiplier.to(device=num_c.device, dtype=torch.int64)
+        if hw_ref_mode_enabled():
+            prod = saturate_int32(prod).to(torch.int64)
+        num_scaled = round_shift(prod, rshift, rounding)
+        den_safe = _safe_divide_denominator(den_c, s_den, eps=eps)
+        quotient = _integer_div_round(num_scaled, den_safe, rounding)
+        acc = int32_add_sat(
+            quotient.to(torch.int32),
+            output_encoding.zero_point.to(device=num_c.device, dtype=torch.int32),
+        )
+        return _wrap_like_output(
+            saturate_sim_tensor(acc, output_encoding.qmin, output_encoding.qmax),
+            output_encoding,
+        )
 
 
 @register_fixed_kernel(custom.Clip)

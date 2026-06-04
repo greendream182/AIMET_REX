@@ -422,6 +422,33 @@ def test_quantized_square_int16_clz_dispatch():
     assert_int16_vs_fp32_reference(y_int, y_fp, max_lsb=8192.0, min_cosine=0.98)
 
 
+@pytest.mark.skipif(resolve_abc_lut_root() is None, reason="abc_lut-shuai not found")
+def test_quantized_square_8bit_int16_clz_aligns_op_grid_to_lut_grid():
+    """MRNN uses W8A8 Square; CLZ LUT is fit on int16 grids and needs §3.0 input align."""
+
+    m = QuantizedSquare()
+    m.input_quantizers[0] = Quantize((), 8, symmetric=True)
+    m.output_quantizers[0] = Quantize((), 8, symmetric=True)
+    m.input_quantizers[0].min = nn.Parameter(torch.tensor(-2.0))
+    m.input_quantizers[0].max = nn.Parameter(torch.tensor(2.0))
+    m.output_quantizers[0].min = nn.Parameter(torch.tensor(0.0))
+    m.output_quantizers[0].max = nn.Parameter(torch.tensor(4.0))
+    x = torch.randn(4, 16, 8, dtype=torch.float32) * 0.5
+
+    with quant_execution_mode(ExecutionMode.FP32_QDQ):
+        m(x)
+
+    with quant_execution_mode(ExecutionMode.FP32_QDQ):
+        y_fp = m(x).dequantize()
+
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_EVAL):
+        y_int = m(x)
+
+    assert isinstance(y_int, Int16QuantizedTensor)
+    assert int((y_int.int_repr != 0).sum().item()) > 0
+    assert_int16_vs_fp32_reference(y_int, y_fp, max_lsb=8192.0, min_cosine=0.98)
+
+
 def test_quantized_exponential_int16_fixed_dispatch():
     m = QuantizedExponential()
     _init_periodic_quantizers(m)

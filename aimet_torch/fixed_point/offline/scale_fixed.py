@@ -8,7 +8,7 @@
 #
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
-"""Offline conversion from float scale to (m_int16, rshift) for fixed_scale_qdq."""
+"""Offline conversion from float scale to (uint16 multiplier, rshift) for fixed_scale_qdq."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _normalize_scalar_m_rshift(m: int, r: int, *, max_rshift: int) -> Tuple[int,
 
 def _quantize_scalar_scale(
     real_scale: float,
-    multiplier_bits: int = 15,
+    multiplier_bits: int = 16,
     max_rshift: int = 31,
 ) -> Tuple[int, int]:
     """Scalar scale → ``(m, r)``; normalize when frexp needs ``rshift > max_rshift``."""
@@ -68,10 +68,15 @@ def _quantize_scalar_scale(
 
 def quantize_scale_to_m_rshift(
     scale: Union[float, torch.Tensor],
-    multiplier_bits: int = 15,
+    multiplier_bits: int = 16,
     max_rshift: int = 31,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert positive scale(s) to ``(m_int16, rshift)`` with ``scale ≈ m / 2**rshift``."""
+    """Convert positive scale(s) to ``(m_int16, rshift)`` with ``scale ≈ m / 2**rshift``.
+
+    The public field is still named ``m_int16`` for sidecar/backward
+    compatibility, but the tensor dtype is ``torch.uint16`` so the full
+    non-negative 16-bit multiplier range ``[0, 65535]`` is available.
+    """
 
     if isinstance(scale, torch.Tensor):
         if torch.any(scale <= 0):
@@ -83,14 +88,14 @@ def quantize_scale_to_m_rshift(
             m, r = _quantize_scalar_scale(float(val.item()), multiplier_bits, max_rshift)
             multipliers.append(m)
             rshifts.append(r)
-        m_t = torch.tensor(multipliers, dtype=torch.int16).reshape(scale.shape)
+        m_t = torch.tensor(multipliers, dtype=torch.uint16).reshape(scale.shape)
         r_t = torch.tensor(rshifts, dtype=torch.int8).reshape(scale.shape)
         return m_t.to(device=scale.device), r_t.to(device=scale.device)
 
     if scale <= 0:
         raise ValueError("scale must be positive for quantize_scale_to_m_rshift.")
     m, r = _quantize_scalar_scale(float(scale), multiplier_bits, max_rshift)
-    return torch.tensor(m, dtype=torch.int16), torch.tensor(r, dtype=torch.int8)
+    return torch.tensor(m, dtype=torch.uint16), torch.tensor(r, dtype=torch.int8)
 
 
 def fixed_scale_encoding_from_tensors(

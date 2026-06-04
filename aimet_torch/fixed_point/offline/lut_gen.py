@@ -429,14 +429,24 @@ def encodings_share_quant_grid(
 
     if source.qmin != target.qmin or source.qmax != target.qmax:
         return False
-    if not torch.equal(
-        source.zero_point.reshape(-1).to(torch.int32),
-        target.zero_point.reshape(-1).to(torch.int32),
-    ):
+
+    devices = {
+        source.scale.device,
+        target.scale.device,
+        source.zero_point.device,
+        target.zero_point.device,
+    }
+    if any(d.type == "cuda" for d in devices):
+        device = next(d for d in devices if d.type == "cuda")
+    else:
+        device = torch.device("cpu")
+
+    z_src = source.zero_point.reshape(-1).to(device=device, dtype=torch.int32)
+    z_tgt = target.zero_point.reshape(-1).to(device=device, dtype=torch.int32)
+    if not torch.equal(z_src, z_tgt):
         return False
-    device = source.scale.device
-    s_src = _effective_scale_fp64(source.scale, device)
-    s_tgt = _effective_scale_fp64(target.scale, device)
+    s_src = _effective_scale_fp64(source.scale.to(device=device), device)
+    s_tgt = _effective_scale_fp64(target.scale.to(device=device), device)
     return bool(torch.allclose(s_src, s_tgt, rtol=rtol, atol=0.0))
 
 

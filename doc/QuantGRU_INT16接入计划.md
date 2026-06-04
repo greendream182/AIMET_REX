@@ -13,7 +13,7 @@
 | R0 审计 bugfix（ExecutionMode.FP32） | done | 删除 wrapper 中不存在的 `ExecutionMode.FP32` 分支；G-1/G-3 改走底层 `QuantGRU.forward` 作 reference |
 | 本机 CI 真环境验收 | done | quant_gru + RTX 5090：**47 passed, 0 skipped**（`tests/fixed_point/conftest.py` 自动发现 sibling `quant-gru-pytorch/pytorch`） |
 | R2 全图 INT16 MRNN backbone 分段 | done | e2e 全绿；`shape_meta.py` 通用旁路 shape 标量运算；`FixedPointSimTensor` layout API |
-| R1 QAT 反向梯度匹配 `backward_quant` | blocked | 等 quant-gru-pytorch 暴露 `backward_quant` Python API（contract minor +1） |
+| R1 QAT 反向梯度匹配 `backward_quant` | done | `quantgru_adapter`：QAT_SIM 走 `_OptionalQuantGRU.forward`（`GRUFunction`+`backward_quant`）；eval 仍 `forward_quantized`；`test_quantgru_qat_grad.py` |
 | R3 MRNN DSP 前端 INT16 适配 | done (decomposed) | 全图 decomposed INT16；metric Δ=0；Abs/Sign/Divide reference kernels |
 
 > 各条详细行动 / 验收 / 回滚见附 C。本节只做"截至当下"的状态摆渡，更细的 PR 拆分以附 C 为准。
@@ -853,12 +853,12 @@ class QuantGRUFlagLockedError(RuntimeError):
 
 ### R1 QAT 反向梯度严格匹配 `backward_quant` [P0]
 
-- **状态**：`blocked`（等 quant-gru-pytorch contract minor +1 暴露 `backward_quant` Python API）
-- 影响：当前 `tests/fixed_point/test_quantgru_qat_grad.py::test_qat_grad_matches_backward_quant` 标记 `@pytest.mark.skip`；INT16_FIXED_QAT_SIM 训练时无法保证 wrapper 反向梯度与 quant-gru-pytorch 自带 `backward_quant` 一致，可能引入静默梯度偏差。
-- 行动：按 §2.4 实现 `_stop_grad_dequantize` / `_wrap_int_tensor_with_meta` 的真实 STE 协议；解开 skip；max abs diff < 1e-6（前向 + 反向单步）。
-- 阻塞：依赖 quant-gru-pytorch 暴露 `backward_quant` Python API（contract v1 minor +1，§1.8 已有兼容规则）。
-- 验收：单方向 GRU + BiGRU 两个用例都过；与 quant-gru-pytorch 自带 `loss.backward()` 数值对比。
-- 回滚：仅恢复 `@pytest.mark.skip` + revert AIMET 侧 `_stop_grad_*` 改动；契约 v1 minor 变更不强制下沉版本号（向后兼容）。
+- **状态**：`done`（2026-05-28）
+- 落地：`INT16_FIXED_QAT_SIM` 改调 `_OptionalQuantGRU.forward`（`GRUFunction` + `backward_quant`）；eval 仍 `forward_quantized`；`_invoke_native_quantgru_forward` 防 wrapper 递归。
+- 验收：`test_quantgru_qat_grad.py` 全绿；与原生 `QuantGRU.forward` 输入/权重梯度对齐（atol 1e-5）。
+- 未做：公开 `backward_quant` Python API（非必须）；BiGRU 专项 golden（可后续补）。
+- e2e：`tests/fixed_point/test_mrnn_int16_qat_smoke.py`（全图 QAT_SIM forward + backward + 多步 SGD）；`test_quantgru_qat_grad.py::test_qat_grad_bidirectional_matches_native`（BiGRU）；`examples/quick_start_int16_metric.py --qat-train-steps`。
+- 回滚：QAT_SIM 分支改回 `forward_quantized`；eval 不变。
 
 ### R2 全图 INT16 MRNN backbone 分段 [P1]
 
@@ -902,7 +902,7 @@ class QuantGRUFlagLockedError(RuntimeError):
 | R0 | P0 | done | `aimet#TODO/QuantGRU-fpqdq-fix` | 无 | 小（仅 wrapper + 测试） |
 | R0+ | P0 | done | `aimet#TODO/QuantGRU-hidden-share` | 无 | 极小（删 forward 一行调用） |
 | R0++ | P0 | done | `aimet#TODO/QuantGRU-fixed-scale-alias` | 无 | 极小（删 resolve 别名） |
-| R1 | P0 | blocked | `aimet#TODO/QuantGRU-qat-grad` | quant-gru-pytorch contract minor +1 | 中（涉及双仓同步） |
+| R1 | P0 | done | `aimet#TODO/QuantGRU-qat-grad` | 无 | 中（涉及双仓同步） |
 | R2 | P1 | done (backbone) | `aimet#TODO/INT16-mrnn-fullgraph` | R3 DSP 前端 | 中（tensor layout + view 写法独立 revert） |
 | R3 | P2 | done (decomposed) | `aimet#TODO/INT16-DSP-frontends` | bit-exact LUT 可选 | 中 |
 

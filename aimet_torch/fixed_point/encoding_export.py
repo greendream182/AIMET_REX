@@ -72,7 +72,7 @@ def fixed_scale_encoding_from_dict(
             "Run convert_encodings_to_fixed_scale(sim) after PTQ/QAT freeze."
         )
     dev = device or torch.device("cpu")
-    m = _jsonable_to_tensor(data["m_int16"], dtype=torch.int16, device=dev)
+    m = _jsonable_to_tensor(data["m_int16"], dtype=torch.uint16, device=dev)
     r = _jsonable_to_tensor(data["rshift"], dtype=torch.int8, device=dev)
     zp = _jsonable_to_tensor(data["zero_point"], dtype=torch.int32, device=dev)
     scale_legacy = None
@@ -143,7 +143,7 @@ def output_encoding_from_dict(
         qmin=base.qmin,
         qmax=base.qmax,
         axis=base.axis,
-        multiplier=_jsonable_to_tensor(mult, dtype=torch.int16, device=dev) if mult is not None else None,
+        multiplier=_jsonable_to_tensor(mult, dtype=torch.uint16, device=dev) if mult is not None else None,
         rshift=_jsonable_to_tensor(rsh, dtype=torch.int8, device=dev) if rsh is not None else None,
     )
 

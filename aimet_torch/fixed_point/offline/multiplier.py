@@ -8,9 +8,9 @@
 #
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
-"""Offline conversion from floating scale to int16 multiplier + rshift.
+"""Offline conversion from floating scale to 16-bit unsigned multiplier + rshift.
 
-The hardware requantize instruction is fixed to ``M_int16`` and ``rshift in
+The hardware requantize instruction is fixed to a 16-bit non-negative ``M`` and ``rshift in
 [0, max_rshift]`` (Ada200 ADR-001, spec 10 §52). When ``frexp`` of a small
 ``real_multiplier`` yields ``rshift > max_rshift`` the conversion is **folded**
 in-place: ``M`` is halved (half-up) and ``rshift`` decremented until the
@@ -197,8 +197,8 @@ def quantize_multiplier(
     out-of-range), useful for debugging or strict CI gates.
     """
 
-    if multiplier_bits <= 0 or multiplier_bits > 15:
-        raise ValueError("multiplier_bits must be in [1, 15].")
+    if multiplier_bits <= 0 or multiplier_bits > 16:
+        raise ValueError("multiplier_bits must be in [1, 16].")
     # rshift is returned as int8; reject ranges that would silently wrap.
     if not 0 <= max_rshift < 128:
         raise ValueError(
@@ -216,13 +216,13 @@ def quantize_multiplier(
                 saturate=saturate,
             )
             return (
-                torch.tensor(multiplier, dtype=torch.int16, device=src_device),
+                torch.tensor(multiplier, dtype=torch.uint16, device=src_device),
                 torch.tensor(rshift, dtype=torch.int8, device=src_device),
             )
 
         flat = real_multiplier_tensor.reshape(-1)
         n = int(flat.numel())
-        flat_m = torch.empty(n, dtype=torch.int16)
+        flat_m = torch.empty(n, dtype=torch.uint16)
         flat_r = torch.empty(n, dtype=torch.int8)
         for i in range(n):
             m_val, s_val = _quantize_scalar_multiplier(
@@ -244,6 +244,6 @@ def quantize_multiplier(
         max_rshift,
         saturate=saturate,
     )
-    return torch.tensor(multiplier, dtype=torch.int16), torch.tensor(
+    return torch.tensor(multiplier, dtype=torch.uint16), torch.tensor(
         rshift, dtype=torch.int8
     )

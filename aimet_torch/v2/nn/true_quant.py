@@ -520,28 +520,36 @@ class _DispatchMixin(metaclass=_DispatchMeta):
             ExecutionMode.INT16_FIXED_QAT_SIM,
         ):
             # pylint: disable=import-outside-toplevel
-            from aimet_torch.v2.quantization.affine.fixed_point import adapter as _fp_adapter
+            from aimet_torch.fixed_point.shape_meta import (
+                is_intentionally_unquantized_module,
+            )
 
-            int16_out = _fp_adapter.dispatch_int16_fixed(self, *args, **kwargs)
-            if int16_out is not None:
-                return int16_out
-            # Distinguish "missing output quantizer" (common with default
-            # super-group config) from "kernel truly unsupported".
-            oq_list = getattr(self, "output_quantizers", None)
-            oq = oq_list[0] if oq_list else None
-            from aimet_torch.v2.quantization.base import QuantizerBase  # noqa: WPS433
-            missing_oq = not (isinstance(oq, QuantizerBase) and oq.is_initialized())
-            hint = (
-                "Output quantizer is missing or uninitialized on this module. "
-                "Call aimet_torch.fixed_point.ensure_output_quantizers_for_int16_eval(sim) "
-                "before sim.compute_encodings(...) to materialize them."
-                if missing_oq
-                else "Add a fixed-point kernel/adapter path or run in fp32_qdq/fp16_qdq mode."
-            )
-            raise RuntimeError(
-                f"INT16 fixed-point execution is not implemented for "
-                f"{type(self).__name__}. {hint}"
-            )
+            if not is_intentionally_unquantized_module(self):
+                from aimet_torch.v2.quantization.affine.fixed_point import (
+                    adapter as _fp_adapter,
+                )
+
+                int16_out = _fp_adapter.dispatch_int16_fixed(self, *args, **kwargs)
+                if int16_out is not None:
+                    return int16_out
+                # Distinguish "missing output quantizer" (common with default
+                # super-group config) from "kernel truly unsupported".
+                oq_list = getattr(self, "output_quantizers", None)
+                oq = oq_list[0] if oq_list else None
+                from aimet_torch.v2.quantization.base import QuantizerBase  # noqa: WPS433
+                missing_oq = not (isinstance(oq, QuantizerBase) and oq.is_initialized())
+                hint = (
+                    "Output quantizer is missing or uninitialized on this module. "
+                    "Call aimet_torch.fixed_point.ensure_output_quantizers_for_int16_eval(sim) "
+                    "before sim.compute_encodings(...) to materialize them."
+                    if missing_oq
+                    else "Add a fixed-point kernel/adapter path or run in fp32_qdq/fp16_qdq mode."
+                )
+                raise RuntimeError(
+                    f"INT16 fixed-point execution is not implemented for "
+                    f"{type(self).__name__}. {hint}"
+                )
+            # disable_quantization 层（Pad/FloorDivide 等）：走下方标准 QDQ 浮点路径。
 
         kernel = self.get_kernel()
         builtin_torch_fn = self._get_builtin_torch_fn()

@@ -111,13 +111,39 @@ def _q_device_dtype(q):
     return torch.device("cpu"), torch.float32
 
 
+def _fresh_fmax_scan_loader(loader) -> "torch.utils.data.DataLoader":
+    """独立于 PTQ calib 迭代状态的 fmax 扫描 loader（shuffle=False，全量）。"""
+    from torch.utils.data import DataLoader
+
+    if not isinstance(loader, DataLoader):
+        return loader
+    return DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        pin_memory=getattr(loader, "pin_memory", False),
+        collate_fn=loader.collate_fn,
+        drop_last=False,
+        worker_init_fn=getattr(loader, "worker_init_fn", None),
+    )
+
+
 def collect_power2_float_out_fmax(
     float_model: nn.Module,
     loader,
     device: torch.device,
-    max_batches: int,
+    max_batches: int | None = None,
+    *,
+    full_scan: bool = True,
 ) -> dict[str, float]:
-    """校准数据上观测 float 图 power_2 输出 fmax（用于 out_max / CLZ head）。"""
+    """校准数据上观测 float 图 power_2 输出 fmax（用于 out_max / CLZ head）。
+
+    ``full_scan=True``（默认）：用独立 DataLoader 对 ``loader.dataset`` 做
+    shuffle=False 全量扫描，避免与 ``loaders['calib']`` 共用迭代器时 epoch 偏移
+    导致 out_max 低估（整图 QDQ+INT16 同进程会差 ~4 pp）。
+    ``full_scan=False``：沿用传入 loader，最多 ``max_batches`` 个 batch。
+    """
     out: dict[str, float] = {}
     handles: list = []
 
@@ -138,11 +164,13 @@ def collect_power2_float_out_fmax(
             continue
         handles.append(mod.register_forward_hook(_make_hook(name)))
 
+    scan_loader = _fresh_fmax_scan_loader(loader) if full_scan else loader
+
     was_training = float_model.training
     float_model.eval()
     with torch.no_grad():
-        for idx, batch in enumerate(loader):
-            if idx >= max_batches:
+        for idx, batch in enumerate(scan_loader):
+            if not full_scan and max_batches is not None and idx >= max_batches:
                 break
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             float_model(x.to(device))
@@ -271,7 +299,7 @@ def apply_mrnn_clz_encoding_fixes_post_calib(
     eps: float = 1e-8,
     verbose: bool = False,
 ) -> dict[str, Any]:
-    """compute_encodings + Po2 之后：reciprocal 分母 + power_2 输出。"""
+    """compute_encodings 之后（可选 legacy Po2 之后）：reciprocal 分母 + power_2 输出。"""
     out: dict[str, Any] = {}
     if reciprocal_denom:
         out["reciprocal_denom"] = fix_reciprocal_denom_encodings(

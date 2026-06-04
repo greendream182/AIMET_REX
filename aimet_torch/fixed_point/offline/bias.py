@@ -19,8 +19,15 @@ def quantize_bias_int32(
     bias_float: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
+    *,
+    saturate: bool = True,
 ) -> torch.Tensor:
-    """Quantize floating bias to int32 accumulator scale."""
+    """Quantize floating bias to int32 accumulator scale.
+
+    When ``saturate`` is True (default), values outside signed INT32 range are
+    clamped instead of raising. This keeps INT16 QAT stable when float bias
+    drifts under SGD while encodings stay frozen.
+    """
 
     if not bias_float.is_floating_point():
         raise TypeError(f"bias_float must be floating point; got {bias_float.dtype}.")
@@ -30,7 +37,9 @@ def quantize_bias_int32(
     acc_scale = x_scale.to(torch.float64) * w_scale.to(torch.float64)
     bias_int64 = torch.round(bias_float.to(torch.float64) / acc_scale).to(torch.int64)
 
-    if torch.any(bias_int64 < INT32_QMIN) or torch.any(bias_int64 > INT32_QMAX):
+    if saturate:
+        bias_int64 = bias_int64.clamp(INT32_QMIN, INT32_QMAX)
+    elif torch.any(bias_int64 < INT32_QMIN) or torch.any(bias_int64 > INT32_QMAX):
         raise ValueError("Quantized bias exceeds int32 range.")
 
     return bias_int64.to(torch.int32)

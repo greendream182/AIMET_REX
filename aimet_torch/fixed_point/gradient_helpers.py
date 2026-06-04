@@ -45,11 +45,14 @@ def stop_grad_dequantize(
     return fp + (fp - fp.detach())
 
 
-def _q_bounds(bitwidth: int, is_symmetric: bool) -> tuple[int, int]:
+def _q_bounds(bitwidth: int, is_symmetric: bool, is_unsigned: bool = False) -> tuple[int, int]:
+    if is_unsigned:
+        return 0, (1 << bitwidth) - 1
     if is_symmetric:
         qmax = (1 << (bitwidth - 1)) - 1
         return -qmax, qmax
-    return 0, (1 << bitwidth) - 1
+    # Signed asymmetric activations use the full two's-complement range.
+    return -(1 << (bitwidth - 1)), (1 << (bitwidth - 1)) - 1
 
 
 def wrap_int_tensor_with_meta(
@@ -60,7 +63,8 @@ def wrap_int_tensor_with_meta(
 
     bitwidth = int(meta.get("bitwidth", 16))
     is_symmetric = bool(meta.get("is_symmetric", True))
-    qmin, qmax = _q_bounds(bitwidth, is_symmetric)
+    is_unsigned = bool(meta.get("is_unsigned", False))
+    qmin, qmax = _q_bounds(bitwidth, is_symmetric, is_unsigned)
 
     device = int_tensor.device
     scale = torch.as_tensor(meta["scale"], dtype=torch.float32, device=device)
@@ -87,7 +91,8 @@ def requantize_fp_to_int(
 
     bitwidth = int(meta.get("bitwidth", 16))
     is_symmetric = bool(meta.get("is_symmetric", True))
-    qmin, qmax = _q_bounds(bitwidth, is_symmetric)
+    is_unsigned = bool(meta.get("is_unsigned", False))
+    qmin, qmax = _q_bounds(bitwidth, is_symmetric, is_unsigned)
 
     device = fp_tensor.device
     scale = torch.as_tensor(meta["scale"], dtype=torch.float32, device=device)

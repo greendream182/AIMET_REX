@@ -17,14 +17,19 @@ def test_int32_add_sat_clamps_wrap(monkeypatch):
     assert int32_add_sat(lhs, rhs).item() == 2_147_483_647
 
 
-def test_int32_add_sat_default_uses_wrapped_int32(monkeypatch):
+def test_int32_add_sat_default_saturates(monkeypatch):
+    """Default is now HW-faithful int32 saturation; opt-out (=0) wraps."""
     monkeypatch.delenv("AIMET_RX_HW_REF", raising=False)
-    monkeypatch.delenv("AIMET_RX_ACC_INT32_SAT", raising=False)
     lhs = torch.tensor([2_000_000_000], dtype=torch.int32)
     rhs = torch.tensor([2_000_000_000], dtype=torch.int32)
     wrapped = (lhs + rhs).to(torch.int32).item()
-    assert int32_add_sat(lhs, rhs).item() == wrapped
     assert wrapped != 2_147_483_647
+
+    monkeypatch.delenv("AIMET_RX_ACC_INT32_SAT", raising=False)
+    assert int32_add_sat(lhs, rhs).item() == 2_147_483_647
+
+    monkeypatch.setenv("AIMET_RX_ACC_INT32_SAT", "0")
+    assert int32_add_sat(lhs, rhs).item() == wrapped
 
 
 def test_int32_sum_sat_clamps_large_reduce(monkeypatch):

@@ -67,6 +67,12 @@ from aimet_torch.fixed_point.offline import (
     record_multiplier_saturations,
 )
 from aimet_torch.fixed_point.qat import FakeQuantInt16STE, fake_quantize_int16_qat
+from aimet_torch.fixed_point.qat_train import (
+    QatTrainScope,
+    run_int16_qat_epochs,
+    run_int16_qat_steps,
+    select_qat_trainable_parameters,
+)
 from aimet_torch.fixed_point.rounding import RoundingMode
 from aimet_torch.fixed_point.sim_utils import (
     ensure_output_quantizers_for_int16_eval,
@@ -122,6 +128,10 @@ __all__ = [
     "quantize_with_fixed_scale",
     "fake_quantize_int16_qat",
     "quantize_multiplier",
+    "QatTrainScope",
+    "run_int16_qat_epochs",
+    "run_int16_qat_steps",
+    "select_qat_trainable_parameters",
     "output_encoding_from_dict",
     "output_encoding_to_dict",
     "record_multiplier_saturations",

@@ -22,7 +22,10 @@ from aimet_torch.fixed_point.gradient_helpers import (  # noqa: E402
     stop_grad_dequantize,
     wrap_int_tensor_with_meta,
 )
-from aimet_torch.fixed_point.quantgru_adapter import dispatch_quantgru_blackbox  # noqa: E402
+from aimet_torch.fixed_point.quantgru_adapter import (  # noqa: E402
+    aimet_configure,
+    dispatch_quantgru_blackbox,
+)
 from aimet_torch.fixed_point.tensor import Int16QuantizedTensor  # noqa: E402
 
 
@@ -77,17 +80,21 @@ def test_wrap_int_tensor_downstream_grad_to_fp_leaf():
     assert fp.grad is not None
 
 
+def _calibrate_quantgru(gru, x: torch.Tensor) -> None:
+    with gru._aimet_unlock_ctx():
+        aimet_configure(gru, "calibrating")
+        with torch.no_grad():
+            gru(x)
+        gru.finalize_calibration(verbose=False)
+
+
 @requires_quant_gru_cuda
 def test_qat_sim_dispatch_returns_float_with_grad_path():
-    from aimet_torch.v2.nn import compute_encodings
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
 
     gru = QuantizedQuantGRU(8, 8, batch_first=True).cuda().train()
     x = torch.randn(2, 4, 8, device="cuda", requires_grad=True)
-
-    with compute_encodings(gru):
-        with torch.no_grad():
-            gru(x)
+    _calibrate_quantgru(gru, x.detach())
 
     with quant_execution_mode(ExecutionMode.INT16_FIXED_QAT_SIM):
         out_fp, hn_fp = dispatch_quantgru_blackbox(gru, x)
@@ -95,16 +102,98 @@ def test_qat_sim_dispatch_returns_float_with_grad_path():
     assert out_fp.dtype == torch.float32
     assert hn_fp.dtype == torch.float32
     assert out_fp.shape == x.shape
+    assert out_fp.requires_grad
 
 
 @requires_quant_gru_cuda
-@pytest.mark.skip(
-    reason="生产验收（§2.4）：待 AIMET adapter 与 QuantGRU backward_quant 数值对齐 CI 就绪"
-)
-def test_qat_grad_matches_backward_quant():
-    """AIMET 边界 identity 反向须与 QuantGRU backward_quant 一致（max abs diff < 1e-6）。"""
+def test_qat_grad_matches_native_forward_quant():
+    """AIMET QAT_SIM dispatch must match native ``forward()`` + ``backward_quant``."""
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
 
+    torch.manual_seed(0)
     gru = QuantizedQuantGRU(8, 8, batch_first=True).cuda().train()
-    x = torch.randn(2, 4, 8, device="cuda", requires_grad=True)
-    del gru, x
+    x = torch.randn(2, 4, 8, device="cuda")
+    _calibrate_quantgru(gru, x)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    from aimet_torch.v2.nn.modules.custom import _OptionalQuantGRU
+
+    with gru._aimet_unlock_ctx():
+        aimet_configure(gru, "int16_fixed_qat_sim")
+    out_ref, _ = _OptionalQuantGRU.forward(gru, x_ref)
+    out_ref.sum().backward()
+    ref_x_grad = x_ref.grad.detach().clone()
+    ref_w_grad = gru.weight_ih_l0.grad.detach().clone()
+
+    gru.zero_grad(set_to_none=True)
+    x_aimet = x.detach().clone().requires_grad_(True)
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_QAT_SIM):
+        out_aimet, _ = dispatch_quantgru_blackbox(gru, x_aimet)
+    out_aimet.sum().backward()
+
+    assert torch.allclose(x_aimet.grad, ref_x_grad, atol=1e-5, rtol=0)
+    assert torch.allclose(gru.weight_ih_l0.grad, ref_w_grad, atol=1e-5, rtol=0)
+
+
+@requires_quant_gru_cuda
+def test_qat_grad_with_int16_upstream_carrier():
+    """INT16 upstream carrier: identity dequant at GRU boundary; weight grads match native."""
+    from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU, _OptionalQuantGRU
+
+    torch.manual_seed(1)
+    gru = QuantizedQuantGRU(8, 8, batch_first=True).cuda().train()
+    x_fp = torch.randn(2, 4, 8, device="cuda")
+    _calibrate_quantgru(gru, x_fp)
+    meta = gru.get_io_quant_meta()
+
+    x_q = Int16QuantizedTensor.from_float(
+        x_fp,
+        scale=torch.tensor(meta["input"]["scale"], device="cuda"),
+        zero_point=torch.tensor(meta["input"]["zp"], dtype=torch.int32, device="cuda"),
+    )
+
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_QAT_SIM):
+        out_aimet, _ = dispatch_quantgru_blackbox(gru, x_q)
+    out_aimet.sum().backward()
+    aimet_w_grad = gru.weight_ih_l0.grad.detach().clone()
+
+    gru.zero_grad(set_to_none=True)
+    x_ref = x_fp.detach().clone().requires_grad_(True)
+    with gru._aimet_unlock_ctx():
+        aimet_configure(gru, "int16_fixed_qat_sim")
+    out_ref, _ = _OptionalQuantGRU.forward(gru, x_ref)
+    out_ref.sum().backward()
+
+    assert aimet_w_grad is not None
+    assert torch.allclose(aimet_w_grad, gru.weight_ih_l0.grad, atol=1e-5, rtol=0)
+
+
+@requires_quant_gru_cuda
+def test_qat_grad_bidirectional_matches_native():
+    """BiGRU: QAT_SIM dispatch grads match native forward + backward_quant."""
+    from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU, _OptionalQuantGRU
+
+    torch.manual_seed(2)
+    gru = QuantizedQuantGRU(8, 8, batch_first=True, bidirectional=True).cuda().train()
+    x = torch.randn(2, 5, 8, device="cuda")
+    _calibrate_quantgru(gru, x)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    with gru._aimet_unlock_ctx():
+        aimet_configure(gru, "int16_fixed_qat_sim")
+    out_ref, _ = _OptionalQuantGRU.forward(gru, x_ref)
+    out_ref.sum().backward()
+    ref_x = x_ref.grad.detach().clone()
+    ref_w_f = gru.weight_ih_l0.grad.detach().clone()
+    ref_w_r = gru.weight_ih_l0_reverse.grad.detach().clone()
+
+    gru.zero_grad(set_to_none=True)
+    x_aimet = x.detach().clone().requires_grad_(True)
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_QAT_SIM):
+        out_aimet, _ = dispatch_quantgru_blackbox(gru, x_aimet)
+    out_aimet.sum().backward()
+
+    assert out_aimet.shape[-1] == 16  # 2 * hidden
+    assert torch.allclose(x_aimet.grad, ref_x, atol=1e-5, rtol=0)
+    assert torch.allclose(gru.weight_ih_l0.grad, ref_w_f, atol=1e-5, rtol=0)
+    assert torch.allclose(gru.weight_ih_l0_reverse.grad, ref_w_r, atol=1e-5, rtol=0)

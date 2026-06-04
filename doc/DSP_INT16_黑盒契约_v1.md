@@ -9,7 +9,7 @@
 |---|---|---|
 | **STFT** (`transform_cpx`) | v1 **decomposed**（Pad + Conv1d INT16）；bit-exact 黑盒见 §2 | `model_preparer` conv1d + INT16 kernel；非独立黑盒 |
 | **BandConverter** | 默认走 **MatMul INT16 kernel**（固定 ERB 矩阵）；可选升级为独立黑盒 | `ensure_output_quantizers` + MatMul dispatch |
-| **PowerCompress / HypotFun / CLN** | v1 **decomposed**（Sqrt/Square/Abs/Sign/Divide/Mean）；reference float 路径 | 无 preserve；``clamp(min=EPS)`` 代替 ``+EPS`` |
+| **PowerCompress / HypotFun / CLN** | v1 **decomposed**（Sqrt/Square **PWL/CLZ**；**Abs PWL**；**Sign 整数精确**；**Divide 整数**；Mean reference） | 无 preserve；``clamp(min=EPS)`` 代替 ``+EPS`` |
 | **QuantizableBatchNorm2d** | v1 **decomposed**（Sub/Add/Sqrt/Divide INT16） | metric 已验收 |
 
 ## 1. 已落地（2026-05-28）
@@ -19,9 +19,10 @@
 | MatMul INT16 kernel | `aimet_torch/fixed_point/kernels/conv_linear.py::MatMulInt16Kernel` |
 | MatMul dispatchable | `aimet_torch/fixed_point/sim_utils.py` |
 | MatMul output scale | `adapter.dispatch_int16_fixed` 双输入 scale 推导 |
-| Divide INT16 kernel | `aimet_torch/fixed_point/kernels/eltwise.py::DivideInt16Kernel`（BN normalize） |
+| Divide INT16 整数 kernel | `kernels/eltwise.py::DivideInt16Kernel`（``M,rshift`` + 整数除 + ``eps`` 防零） |
 | STFT decomposed | `model_preparer` conv1d + `DynamicConv1d`；`examples/common/torch_stft.py::forward` |
-| Abs / Sign INT16 kernel | `kernels/eltwise.py`（PowerCompress decompose） |
+| Abs INT16 PWL kernel | `kernels/lut.py::AbsInt16Kernel` + adapter 自动 `pwl_lut` |
+| Sign INT16 整数精确 kernel | `kernels/eltwise.py::SignInt16Kernel` |
 | 全图 metric | `quick_start_int16_metric.py`：无 FP32 preserve；Δ=0 pp |
 | shape 标量旁路 | `aimet_torch/fixed_point/shape_meta.py`（`b*f` 等 layout 元数据） |
 | FixedPointSimTensor layout | `aimet_torch/fixed_point/tensor.py` |
@@ -58,9 +59,9 @@ def aimet_capabilities(self) -> dict: ...
 |---|---|
 | R3-min（当前） | `test_mrnn_int16_frontend_segment.py` 全绿；metric Δ≤0.5 pp；`diagnose` 全绿 |
 | R3-full | 全图 decomposed INT16 metric Δ≤0.5 pp（已完成） |
-| R3-bit-exact | Abs/Sign/Divide/Pow0.5 bit-exact LUT；STFT 黑盒 |
+| R3-bit-exact | Abs/Sign/Divide ✅；Pow0.5；STFT 黑盒 |
 
 ## 5. 阻塞
 
-- **bit-exact LUT**（可选）：Abs/Sign/Divide/Pow0.5 当前为 reference float 路径
+- **bit-exact LUT**（可选）：Pow0.5 等待；Abs/Sign/Divide 已落地
 - **STFT bit-exact 黑盒**（可选）：integer FFT/im2col 语义定义

@@ -51,3 +51,11 @@ def maybe_int16_carrier(data: Any) -> Optional[Int16QuantizedTensor]:
     if isinstance(data, torch.Tensor) and data.is_floating_point():
         return consume_int16_carrier(data)
     return None
+
+
+def clear_int16_carriers() -> None:
+    """Drop any unconsumed QAT carriers from the current execution context."""
+
+    mapping = _int16_carrier_map.get()
+    if mapping:
+        mapping.clear()

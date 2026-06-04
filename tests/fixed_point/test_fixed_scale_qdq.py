@@ -70,7 +70,7 @@ def test_v2_quantize_dequantize_fixed_scale_mode_matches_fp32():
 
 def test_fixed_scale_encoding_json_roundtrip():
     enc = FixedScaleEncoding(
-        m_int16=torch.tensor([1, 2], dtype=torch.int16),
+        m_int16=torch.tensor([1, 2], dtype=torch.uint16),
         rshift=torch.tensor([3, 4], dtype=torch.int8),
         zero_point=torch.tensor([0, 1], dtype=torch.int32),
         qmin=-128,
@@ -79,7 +79,8 @@ def test_fixed_scale_encoding_json_roundtrip():
     )
     data = fixed_scale_encoding_to_dict(enc)
     restored = fixed_scale_encoding_from_dict(data)
-    assert torch.equal(restored.m_int16, enc.m_int16)
+    assert restored.m_int16.dtype == torch.uint16
+    assert torch.equal(restored.m_int16.to(torch.int64), enc.m_int16.to(torch.int64))
     assert torch.equal(restored.rshift, enc.rshift)
 
 

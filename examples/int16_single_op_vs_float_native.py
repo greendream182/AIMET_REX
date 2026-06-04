@@ -3,6 +3,9 @@
 
 参考输出取自 ``prepare_model`` 后的浮点副本（同分解图、无 QDQ），与 sim 上
 Quantized* 模块名一一对应；整图 Top-1 baseline 仍用未包装 MRNN 报告。
+
+Scale（Design v2 / INT16 新项目）：默认 ``convert_encodings_to_fixed_scale``（M,rshift），
+**不**默认全图 Po2。``--apply-po2`` 仅 legacy/对比用，勿作为 INT16 验收主路径。
 """
 from __future__ import annotations
 
@@ -398,7 +401,7 @@ def build_sim(
     square_output_bypass: bool = False,
     clz_encoding_fix: bool = False,
     clz_post_qat: bool = False,
-    apply_po2: bool = True,
+    apply_po2: bool = False,
     clz_sign_bypass: bool = True,
     qat_val_loader=None,
     qat_max_batches: int | None = None,
@@ -449,8 +452,9 @@ def build_sim(
             print("WARNING: --square-output-bypass 未匹配任何 output quantizer")
 
     sim.model.to(device).eval()
+    calib_loader = qs.fresh_calib_loader(loaders["calib"])
     with torch.no_grad(), qs.aimet.nn.compute_encodings(sim.model):
-        for idx, (x, _) in enumerate(loaders["calib"]):
+        for idx, (x, _) in enumerate(calib_loader):
             if idx >= max_calib:
                 break
             sim.model(x.to(device))
@@ -539,6 +543,11 @@ def main() -> None:
         help="§2.3 encoding 修复：sign input bypass + reciprocal 分母 + power_2 out_max",
     )
     parser.add_argument(
+        "--apply-po2",
+        action="store_true",
+        help="[legacy] 校准后全图 apply_power_of_2_workflow；INT16 新项目默认关",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).resolve().parent / "output" / "int16_single_op_vs_float_native.json",
@@ -578,6 +587,7 @@ def main() -> None:
         div_denom_input_bypass=args.div_denom_input_bypass,
         square_output_bypass=args.square_output_bypass,
         clz_encoding_fix=args.clz_encoding_fix,
+        apply_po2=args.apply_po2,
     )
     print(f"sim 构建+校准{' (+QAT)' if not args.skip_qat else ''}: {time.time() - t0:.1f}s")
 

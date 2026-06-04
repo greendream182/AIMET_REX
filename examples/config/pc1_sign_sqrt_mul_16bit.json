@@ -1,0 +1,296 @@
+{
+  "description": "B' 候选：在 B 档（sign+sqrt 16bit）基础上把 power_compress_1.module_mul 也提到 16bit。理由：mul 是 PC1 链出口（→ pre_bn），cos_local 0.998 但 rel 0.49，8bit output 截断对下游主链有 50% 量级损伤；保护它是 PC1 链最后一道边界。",
+  "comment": "本配置不引用任何模型特定的 layer name，复用到不同 MRNN 变体均可工作。如需对模型中的 EPS 加法 / 标量 size 乘法这类无意义量化点做精细 disable，请在 layer_name_config 中按需追加 wildcard，比如 *.cln.module_add_* / module_floordiv* 等；这些孤儿 quantizer 即使 NOT_INITIALIZED 通常也不阻断 forward，配合 step14 的兜底 compute_encodings 即可",
+  "default_bitwidth": {
+    "weight": 8,
+    "output": 8
+  },
+  "layer_type_config": {
+    "QuantizedConv2d": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "Conv2d 8bit weight + 16bit bias"
+    },
+    "QuantizedConvTranspose2d": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedLinear": {
+      "weight_bitwidth": 8,
+      "bias_bitwidth": 16,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "per_channel_quantization": true,
+      "disable_quantization": false
+    },
+    "QuantizedBatchNorm2d": {
+      "weight_bitwidth": 8,
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedTanh": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSigmoid": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedAdd": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedMultiply": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSubtract": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedDivide": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedPow": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSqrt": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedMean": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedVar": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedConcat": {
+      "output_bitwidth": 8,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedAbs": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedSign": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedClip": {
+      "input_bitwidth": 8,
+      "output_bitwidth": 8,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false
+    },
+    "QuantizedFloorDivide": {
+      "disable_quantization": true,
+      "comment": "整数 size / index 类计算，量化无意义"
+    },
+    "QuantizedPad": {
+      "disable_quantization": true,
+      "comment": "padding 常量索引，量化无意义"
+    }
+  },
+  "layer_name_config": {
+    "_comment": "只升级 power_compress_1 链中 cos_local 最差的两个节点：sign(0.19) 与 sqrt(0.88)；abs/mul cos_local≥0.99 保持 8bit。其他 frontend 模块（trans/pre_bn/hypot/fft2band/power_compress_2）均按全 8bit 走，验证是否单靠这 2 个节点 16bit 就能恢复大部分精度。",
+    "power_compress_1.module_sign*": {
+      "input_bitwidth": 16,
+      "output_bitwidth": 16,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "cos_local=0.19，根因：8bit 把 small x 量到 0 附近，sign 翻转"
+    },
+    "power_compress_1.module_sqrt*": {
+      "input_bitwidth": 16,
+      "output_bitwidth": 16,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "cos_local=0.88，sqrt 对小值放大舍入误差"
+    },
+    "power_compress_1.module_mul*": {
+      "input_bitwidth": 16,
+      "output_bitwidth": 16,
+      "input_symmetric": true,
+      "output_symmetric": true,
+      "disable_quantization": false,
+      "comment": "cos_local=0.998 但 rel=0.49；PC1 出口边界，必须保护"
+    }
+  },
+  "GRU_config": {
+    "default_config": {
+      "disable_quantization": false,
+      "comment": "启用 QuantGRU 量化；此处为统一总开关"
+    },
+    "operator_config": {
+      "x": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "输入序列 x"
+      },
+      "h": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "隐藏状态 h"
+      },
+      "W": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "quantization_granularity": "PER_TENSOR",
+        "comment": "weight_ih (z/r/n 三门权重)"
+      },
+      "R": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "quantization_granularity": "PER_TENSOR",
+        "comment": "weight_hh (z/r/n 三门权重)"
+      },
+      "bw": {
+        "bitwidth": 16,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "quantization_granularity": "PER_TENSOR",
+        "comment": "bias_ih"
+      },
+      "br": {
+        "bitwidth": 16,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "quantization_granularity": "PER_TENSOR",
+        "comment": "bias_hh"
+      },
+      "weight_ih_linear": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "W*x + bw 输出"
+      },
+      "weight_hh_linear": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "R*h + br 输出"
+      },
+      "update_gate_input": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "更新门 z 激活前"
+      },
+      "update_gate_output": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": true,
+        "comment": "sigmoid(z), [0,1] 用 UINT 充分利用范围"
+      },
+      "reset_gate_input": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "重置门 r 激活前"
+      },
+      "reset_gate_output": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": true,
+        "comment": "sigmoid(r), [0,1] 用 UINT"
+      },
+      "new_gate_input": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "候选门 n 激活前"
+      },
+      "new_gate_output": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "tanh(n), [-1,1]"
+      },
+      "mul_reset_hidden": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "r * weight_hh_linear_n"
+      },
+      "mul_old_contribution": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "z * h_old"
+      },
+      "mul_new_contribution": {
+        "bitwidth": 8,
+        "is_symmetric": true,
+        "is_unsigned": false,
+        "comment": "(1-z) * n"
+      }
+    }
+  },
+  "default_config": {
+    "disable_quantization": false,
+    "comment": "默认全开量化。这里是 v2 工具决策的最低优先级开关"
+  }
+}

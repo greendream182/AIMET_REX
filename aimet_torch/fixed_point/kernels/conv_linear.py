@@ -22,6 +22,7 @@ from aimet_torch.fixed_point.kernels._im2col import im2col_int
 from aimet_torch.fixed_point.registry import register_fixed_kernel
 from aimet_torch.fixed_point.requantize import (
     SIM_TENSOR_DTYPE,
+    _env_truthy,
     mac_accumulator_int32_sat_enabled,
     requantize_int,
     saturate_mac_accumulator,
@@ -97,6 +98,19 @@ def _add_bias(acc: torch.Tensor, bias: torch.Tensor, view_shape: Tuple[int, ...]
     return acc + bias.to(device=acc.device, dtype=acc.dtype).view(view_shape)
 
 
+def _matmul_fast_fp32_enabled() -> bool:
+    """Opt-in: use float32 CUDA matmul for speed at the cost of bit-exactness.
+
+    A single ``int16 * int16`` product can reach 2**30, exceeding float32's
+    24-bit exact-integer range (2**24); the K-accumulation diverges further.
+    This is a *fast approximate preview* only and MUST NOT back sign-off.
+    Default is float64 accumulation, which is bit-exact for int16 ranges and
+    matches the CPU integer reference across devices.
+    """
+
+    return _env_truthy("AIMET_RX_MATMUL_FAST_FP32")
+
+
 def _int32_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Integer MAC with CUDA-safe fallback (PyTorch CUDA lacks integer matmul)."""
 
@@ -105,7 +119,11 @@ def _int32_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         return saturate_mac_accumulator(prod.to(torch.int64))
 
     if lhs.is_cuda or rhs.is_cuda:
-        prod = torch.matmul(lhs.to(torch.float32), rhs.to(torch.float32))
+        if _matmul_fast_fp32_enabled():
+            prod = torch.matmul(lhs.to(torch.float32), rhs.to(torch.float32))
+            return prod.round().to(torch.int32)
+        # Default: float64 is bit-exact for int16 operands and device-invariant.
+        prod = torch.matmul(lhs.to(torch.float64), rhs.to(torch.float64))
         return prod.round().to(torch.int32)
 
     return torch.matmul(lhs, rhs)

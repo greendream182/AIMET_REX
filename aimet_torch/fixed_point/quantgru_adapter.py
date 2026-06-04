@@ -104,6 +104,7 @@ def _meta_from_quant_params(
         "zp": int(zp),
         "bitwidth": bitwidth,
         "is_symmetric": is_symmetric,
+        "is_unsigned": is_unsigned,
     }
 
 
@@ -256,6 +257,76 @@ def _maybe_dequantize_input(
     raise TypeError(f"Unsupported QuantGRU input type: {type(data).__name__}.")
 
 
+def _run_forward_quantized_bit_exact(
+    module: nn.Module,
+    fp_input: torch.Tensor,
+    fp_hx: Optional[torch.Tensor],
+    mode_str: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``forward_quantized`` path for INT16 eval (bit-exact, no autograd)."""
+
+    unlock = getattr(module, "_aimet_unlock_ctx", None)
+    has_bound_fwd_q = callable(getattr(module, "forward_quantized", None))
+
+    if unlock is not None and has_bound_fwd_q:
+        with unlock():
+            aimet_configure(module, mode_str)
+            return module.forward_quantized(fp_input, fp_hx)
+    aimet_configure(module, mode_str)
+    return forward_quantized(module, fp_input, fp_hx)
+
+
+def _invoke_native_quantgru_forward(
+    module: nn.Module,
+    fp_input: torch.Tensor,
+    fp_hx: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Call ``QuantGRU.forward`` without re-entering ``QuantizedQuantGRU`` dispatch."""
+
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.v2.nn.modules.custom import _OptionalQuantGRU
+
+    if _OptionalQuantGRU is not None and isinstance(module, _OptionalQuantGRU):
+        return _OptionalQuantGRU.forward(module, fp_input, fp_hx)
+    return module.forward(fp_input, fp_hx)
+
+
+def _run_forward_quant_qat(
+    module: nn.Module,
+    fp_input: torch.Tensor,
+    fp_hx: Optional[torch.Tensor],
+    mode_str: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantized ``forward()`` for QAT (``GRUFunction`` + ``backward_quant``)."""
+
+    unlock = getattr(module, "_aimet_unlock_ctx", None)
+    if unlock is not None:
+        with unlock():
+            aimet_configure(module, mode_str)
+            return _invoke_native_quantgru_forward(module, fp_input, fp_hx)
+    aimet_configure(module, mode_str)
+    return _invoke_native_quantgru_forward(module, fp_input, fp_hx)
+
+
+def _publish_qat_sim_carriers(
+    fp_out: torch.Tensor,
+    fp_hn: torch.Tensor,
+    meta: Dict[str, Dict[str, Any]],
+) -> None:
+    """Attach INT16 carriers for super-group handoff; grads stay on ``fp_*`` (§2.4)."""
+
+    out_q = wrap_int_tensor_with_meta(
+        requantize_fp_to_int(fp_out.detach(), meta["output"]),
+        meta["output"],
+    )
+    hn_q = wrap_int_tensor_with_meta(
+        requantize_fp_to_int(fp_hn.detach(), meta["hidden"]),
+        meta["hidden"],
+    )
+    publish_int16_carrier(fp_out, out_q)
+    publish_int16_carrier(fp_hn, hn_q)
+
+
 def dispatch_quantgru_blackbox(
     module: nn.Module,
     input: torch.Tensor,
@@ -265,27 +336,21 @@ def dispatch_quantgru_blackbox(
 
     fp_input = _maybe_dequantize_input(input)
     fp_hx = _maybe_dequantize_input(hx) if hx is not None else None
-
-    unlock = getattr(module, "_aimet_unlock_ctx", None)
-    has_bound_fwd_q = callable(getattr(module, "forward_quantized", None))
-
-    if unlock is not None and has_bound_fwd_q:
-        with unlock():
-            aimet_configure(module, get_quant_execution_mode().value)
-            int_out, int_hn = module.forward_quantized(fp_input, fp_hx)
-    else:
-        aimet_configure(module, get_quant_execution_mode().value)
-        int_out, int_hn = forward_quantized(module, fp_input, fp_hx)
-    meta = get_io_quant_meta(module)
-    out_q = wrap_int_tensor_with_meta(int_out, meta["output"])
-    hn_q = wrap_int_tensor_with_meta(int_hn, meta["hidden"])
-
     mode = get_quant_execution_mode()
-    if mode is ExecutionMode.INT16_FIXED_QAT_SIM:
-        out_fp = out_q.to_float(torch.float32)
-        hn_fp = hn_q.to_float(torch.float32)
-        publish_int16_carrier(out_fp, out_q)
-        publish_int16_carrier(hn_fp, hn_q)
-        return out_fp, hn_fp
+    mode_str = resolve_quantgru_mode_str(mode)
 
-    return out_q, hn_q
+    if mode is ExecutionMode.INT16_FIXED_QAT_SIM:
+        if not module.training:
+            raise RuntimeError(
+                "INT16_FIXED_QAT_SIM requires QuantGRU in train() mode so "
+                "GRUFunction saves QAT masks for backward_quant."
+            )
+        fp_out, fp_hn = _run_forward_quant_qat(module, fp_input, fp_hx, mode_str)
+        _publish_qat_sim_carriers(fp_out, fp_hn, get_io_quant_meta(module))
+        return fp_out, fp_hn
+
+    int_out, int_hn = _run_forward_quantized_bit_exact(module, fp_input, fp_hx, mode_str)
+    return (
+        wrap_int_tensor_with_meta(int_out, get_io_quant_meta(module)["output"]),
+        wrap_int_tensor_with_meta(int_hn, get_io_quant_meta(module)["hidden"]),
+    )

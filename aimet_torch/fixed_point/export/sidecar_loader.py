@@ -29,6 +29,7 @@ _INT16_SIDECAR_VERSION = "1.0.0-int16-fixed"
 _INT16_SIDECAR_PATH_ENV = "AIMET_RX_INT16_SIDECAR_PATH"
 
 _INT16_SIDECAR_EXTRA_ATTR = "_int16_sidecar_extra"
+_INT16_ONLINE_EXTRA_ATTR = "_int16_online_extra"
 _ATTACHED_PATH_BY_MODEL: "weakref.WeakKeyDictionary[nn.Module, str]" = (
     weakref.WeakKeyDictionary()
 )
@@ -225,6 +226,58 @@ def get_int16_sidecar_extra(module: nn.Module) -> Optional[dict[str, Any]]:
 
     value = getattr(module, _INT16_SIDECAR_EXTRA_ATTR, None)
     return value if isinstance(value, dict) else None
+
+
+def _move_lut_payload_to_device(payload: Any, device: torch.device) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: _move_lut_payload_to_device(value, device)
+            for key, value in payload.items()
+        }
+    if torch.is_tensor(payload):
+        return payload.to(device)
+    return payload
+
+
+def get_int16_online_extra(
+    module: nn.Module,
+    *,
+    device: Optional[torch.device] = None,
+) -> Optional[dict[str, Any]]:
+    """Return module-local LUT cache populated by online INT16 dispatch."""
+
+    cached = getattr(module, _INT16_ONLINE_EXTRA_ATTR, None)
+    if not isinstance(cached, dict) or not cached:
+        return None
+    if device is None:
+        return dict(cached)
+    return {
+        key: _move_lut_payload_to_device(value, device)
+        for key, value in cached.items()
+    }
+
+
+def merge_int16_online_extra(module: nn.Module, updates: Mapping[str, Any]) -> None:
+    """Persist generated PWL/CLZ payloads on ``module`` for later forwards."""
+
+    if not updates:
+        return
+    bucket = getattr(module, _INT16_ONLINE_EXTRA_ATTR, None)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        setattr(module, _INT16_ONLINE_EXTRA_ATTR, bucket)
+    for key, value in updates.items():
+        if key.endswith("_metrics") or key.endswith("_error"):
+            continue
+        bucket[key] = value
+
+
+def clear_int16_online_extra(model: nn.Module) -> None:
+    """Drop online LUT cache from all submodules (e.g. after encoding change)."""
+
+    for module in model.modules():
+        if hasattr(module, _INT16_ONLINE_EXTRA_ATTR):
+            delattr(module, _INT16_ONLINE_EXTRA_ATTR)
 
 
 def maybe_attach_int16_sidecar_from_env(

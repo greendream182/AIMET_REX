@@ -267,6 +267,23 @@ def build_dataloaders(root: str):
     }
 
 
+def fresh_calib_loader(loader: DataLoader) -> DataLoader:
+    """独立 calib DataLoader（同 SEED、epoch 1），避免多 sim 串行 build 时迭代器偏移。"""
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    return DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        shuffle=True,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+        collate_fn=loader.collate_fn,
+        drop_last=loader.drop_last,
+        worker_init_fn=worker_init_fn,
+        generator=g,
+    )
+
+
 # ============================================================================
 # 模型定义（非 AIMET 标准用法，与量化无关）
 # ============================================================================

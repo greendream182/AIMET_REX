@@ -20,7 +20,7 @@ INT16_QMIN = -32768
 INT16_QMAX = 32767
 INT32_QMIN = -2147483648
 INT32_QMAX = 2147483647
-MULTIPLIER_QBITS = 15
+MULTIPLIER_QBITS = 16
 MULTIPLIER_MAX = (1 << MULTIPLIER_QBITS) - 1
 
 # ADR-013: G3 sim-tensor 段载体容器统一为 torch.int32（FixedPointSimTensor.int_repr 的 dtype）。
@@ -56,9 +56,20 @@ def requantize_int32_prod_sat_enabled() -> bool:
 
 
 def mac_accumulator_int32_sat_enabled() -> bool:
-    """INT32 saturate dot-product / conv accumulator before output requantize."""
+    """INT32 saturate dot-product / conv accumulator before output requantize.
 
-    return _env_truthy("AIMET_RX_ACC_INT32_SAT") or hw_ref_mode_enabled()
+    Default ON (HW-faithful: the accumulator can exceed int32 for realistic K,
+    so we clamp to the INT32 ALU width instead of silently wrapping). Set
+    ``AIMET_RX_ACC_INT32_SAT=0`` to opt out (legacy non-saturating int32 cast).
+    ``AIMET_RX_HW_REF`` always forces it on.
+    """
+
+    if hw_ref_mode_enabled():
+        return True
+    raw = os.environ.get("AIMET_RX_ACC_INT32_SAT")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes")
+    return True
 
 
 def saturate_mac_accumulator(acc: torch.Tensor) -> torch.Tensor:
@@ -110,14 +121,18 @@ def _validate_requantize_inputs(
 ):
     if acc.dtype != torch.int32:
         raise TypeError(f"acc must be torch.int32; got {acc.dtype}.")
-    if multiplier.dtype != torch.int16:
-        raise TypeError(f"multiplier must be torch.int16; got {multiplier.dtype}.")
+    if multiplier.dtype not in (torch.int16, torch.uint16):
+        raise TypeError(
+            f"multiplier must be torch.int16 or torch.uint16; got {multiplier.dtype}."
+        )
     if rshift.dtype != torch.int8:
         raise TypeError(f"rshift must be torch.int8; got {rshift.dtype}.")
     if y_zp.dtype != torch.int32:
         raise TypeError(f"y_zp must be torch.int32; got {y_zp.dtype}.")
 
-    if torch.any(multiplier < 0) or torch.any(multiplier > MULTIPLIER_MAX):
+    if torch.any(multiplier.to(torch.int64) < 0) or torch.any(
+        multiplier.to(torch.int64) > MULTIPLIER_MAX
+    ):
         raise ValueError(f"multiplier must be in [0, {MULTIPLIER_MAX}].")
     if torch.any(rshift < 0) or torch.any(rshift > 31):
         raise ValueError("rshift must be in [0, 31].")

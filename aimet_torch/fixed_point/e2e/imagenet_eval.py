@@ -56,6 +56,19 @@ IMAGENET_LIGHT_DEFAULT_SAMPLES = 64
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 
 
+def _imagenet_val_fallback_candidates() -> List[Path]:
+    """Default search paths when ``AIMET_RX_IMAGENET_VAL`` is unset."""
+
+    home = Path.home()
+    return [
+        home / "datasets" / "imagenet" / "val",
+        home / "data" / "imagenet" / "val",
+        Path("/data/imagenet/val"),
+        Path("/datasets/imagenet/val"),
+        home / "workspace" / "llama.cpp" / "datasets" / "imagenet1K" / "imagenet_val",
+    ]
+
+
 def resolve_imagenet_val_dir() -> Optional[Path]:
     """Return ImageNet ``val/`` root if configured or found under common paths."""
 
@@ -63,16 +76,7 @@ def resolve_imagenet_val_dir() -> Optional[Path]:
     env = os.environ.get(IMAGENET_VAL_ENV, "").strip()
     if env:
         candidates.append(Path(env).expanduser())
-    home = Path.home()
-    candidates.extend(
-        [
-            home / "datasets" / "imagenet" / "val",
-            home / "data" / "imagenet" / "val",
-            Path("/data/imagenet/val"),
-            Path("/datasets/imagenet/val"),
-            Path.home() / "workspace" / "llama.cpp" / "datasets" / "imagenet1K" / "imagenet_val",
-        ]
-    )
+    candidates.extend(_imagenet_val_fallback_candidates())
     for path in candidates:
         if path.is_dir() and any(path.iterdir()):
             return path

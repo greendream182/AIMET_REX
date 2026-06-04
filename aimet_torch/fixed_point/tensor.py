@@ -35,6 +35,9 @@ from aimet_torch.fixed_point.requantize import (
     saturate_sim_tensor,
 )
 
+UINT16_QMAX = (1 << 16) - 1
+MAX_16BIT_LEVELS = 1 << 16
+
 if TYPE_CHECKING:
     from aimet_torch.fixed_point.encoding import FixedScaleEncoding
 
@@ -82,11 +85,17 @@ class FixedPointSimTensor:
                 f"int_repr must be {SIM_TENSOR_DTYPE}; got {self.int_repr.dtype}."
             )
 
-        if self.qmin < INT16_QMIN or self.qmax > INT16_QMAX:
+        num_levels = int(self.qmax) - int(self.qmin) + 1
+        if (
+            self.qmin < INT16_QMIN
+            or self.qmax > UINT16_QMAX
+            or num_levels <= 0
+            or num_levels > MAX_16BIT_LEVELS
+        ):
             raise ValueError(
-                f"qmin/qmax ({self.qmin}, {self.qmax}) must lie within "
-                f"[{INT16_QMIN}, {INT16_QMAX}] until >16bit quantizers are supported "
-                "(ADR-014)."
+                f"qmin/qmax ({self.qmin}, {self.qmax}) must describe a <=16-bit "
+                f"semantic grid within [{INT16_QMIN}, {UINT16_QMAX}] "
+                "until >16bit quantizers are supported (ADR-014)."
             )
 
         if self.zero_point.dtype != torch.int32:

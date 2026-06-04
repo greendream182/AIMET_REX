@@ -90,10 +90,19 @@ def test_quantize_bias_int32():
     x_scale = torch.tensor(0.5, dtype=torch.float32)
     w_scale = torch.tensor(0.25, dtype=torch.float32)
 
-    bias_int32 = quantize_bias_int32(bias, x_scale, w_scale)
+    bias_int32 = quantize_bias_int32(bias, x_scale, w_scale, saturate=False)
 
     assert bias_int32.dtype == torch.int32
     assert bias_int32.tolist() == [2, -4]
+
+
+def test_quantize_bias_int32_saturates_by_default():
+    bias = torch.tensor([1e6], dtype=torch.float32)
+    x_scale = torch.tensor(1e-6, dtype=torch.float32)
+    w_scale = torch.tensor(1.0, dtype=torch.float32)
+
+    bias_int32 = quantize_bias_int32(bias, x_scale, w_scale)
+    assert int(bias_int32.item()) == 2147483647
 
 
 def test_quantize_scale_to_m_rshift_batched_tensor():

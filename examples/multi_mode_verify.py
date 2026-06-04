@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PTQ→Po2→QAT 后在各 ExecutionMode 下评估（验收 conv1d 修复 + 多模式）。"""
+"""PTQ→（可选 legacy Po2）→QAT 后在各 ExecutionMode 下评估（验收 conv1d 修复 + 多模式）。"""
 import contextlib
 import os
 
@@ -22,6 +22,10 @@ torchaudio.load = _soundfile_load
 
 import quick_start as qs  # noqa: E402
 import quick_start_int16_metric as qs_int16  # noqa: E402
+from common.mrnn_clz_encoding import (  # noqa: E402
+    apply_mrnn_clz_encoding_fixes_post_calib,
+    collect_power2_float_out_fmax,
+)
 from aimet_torch.fixed_point import (
     ExecutionMode,
     convert_encodings_to_fixed_scale,
@@ -68,10 +72,11 @@ def build_sim_qs(fp_model, dummy, bitwidth_json):
     return sim
 
 
-def run_calib_ptq_po2_qat(sim, loaders, device, *, apply_po2: bool = True):
+def run_calib_ptq_po2_qat(sim, loaders, device, *, apply_po2: bool = False):
     sim.model.to(device).eval()
+    calib_loader = qs.fresh_calib_loader(loaders["calib"])
     with torch.no_grad(), qs.aimet.nn.compute_encodings(sim.model):
-        for idx, (x, _) in enumerate(loaders["calib"]):
+        for idx, (x, _) in enumerate(calib_loader):
             if idx >= qs.MAX_CALIB_BATCHES:
                 break
             sim.model(x.to(device))
@@ -174,18 +179,24 @@ def main():
     else:
         fp_b = qs.MRNN(output_dim=qs.NUM_CLASSES).to(qs.DEVICE)
         fp_b.load_state_dict(state, strict=False)
-        sim_b = qs_int16.build_sim(fp_b, dummy, bitwidth_config=int16_bw)
-        # INT16 验收：calib 后转 fixed_scale，默认不跑全图 Po2；可选 fp32 QAT 再评 INT16
+        sim_b, prepared_float = qs_int16.build_sim(fp_b, dummy, bitwidth_config=int16_bw)
         sim_b.model.to(qs.DEVICE).eval()
+        calib_loader = qs.fresh_calib_loader(loaders["calib"])
         with torch.no_grad(), qs.aimet.nn.compute_encodings(sim_b.model):
-            for idx, (x, _) in enumerate(loaders["calib"]):
+            for idx, (x, _) in enumerate(calib_loader):
                 if idx >= qs.MAX_CALIB_BATCHES:
                     break
                 sim_b.model(x.to(qs.DEVICE))
-        ptq_b = eval_mode(sim_b.model, loaders["test"], qs.DEVICE, ExecutionMode.FP32_QDQ)
+        if prepared_float is not None:
+            pf = prepared_float.to(qs.DEVICE).eval()
+            power2_fmax = collect_power2_float_out_fmax(
+                pf, loaders["calib"], qs.DEVICE, qs.MAX_CALIB_BATCHES,
+            )
+            apply_mrnn_clz_encoding_fixes_post_calib(
+                sim_b.model, power2_float_out_fmax=power2_fmax, verbose=False,
+            )
         convert_encodings_to_fixed_scale(sim_b)
-        print(f"  PTQ(fp32)={ptq_b*100:.2f}%（无 Po2）")
-        print("  INT16 模式评估（post-calib，无 fp32 QAT）:")
+        print("  INT16 模式评估（post-calib + CLZ fix，无 fp32 QAT）:")
         res_b = eval_modes_after_qat(
             sim_b,
             loaders,

@@ -47,6 +47,7 @@ PWL_VS_ANALYTIC_PER_FN_LIMITS: dict[str, dict[str, float]] = {
     "cos":     {"max_lsb": 512.0, "p99_lsb": 400.0, "rmse_lsb": 120.0},
     "exp":     {"max_lsb": 2048.0, "p99_lsb": 1500.0, "rmse_lsb": 400.0},
     "log":     {"max_lsb": 2048.0, "p99_lsb": 1500.0, "rmse_lsb": 400.0},
+    "abs":     {"max_lsb": 8.0, "p99_lsb": 4.0, "rmse_lsb": 2.0},
 }
 
 # Fallback when an unlisted activation is fitted. Loose enough to catch only broken fits.

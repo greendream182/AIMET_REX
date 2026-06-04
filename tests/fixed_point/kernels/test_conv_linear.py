@@ -66,8 +66,8 @@ def test_conv2d_int16_kernel_reference_case():
     assert output.int_repr.tolist() == [[[[5]]]]
 
 
-def test_linear_int32_accumulator_sat_differs_under_hw_ref(monkeypatch):
-    """``AIMET_RX_HW_REF=1`` clamps int32 MAC before requantize (no silent wrap)."""
+def test_linear_int32_accumulator_saturates_by_default(monkeypatch):
+    """int32 MAC saturation is now the default (HW-faithful); opt-out (=0) wraps."""
     x = _int16_tensor([[32_767, 32_767, 32_767]])
     weight = _int16_tensor([[32_767, 32_767, 32_767]])
     output_encoding = _output_encoding(multiplier=1, rshift=0, scale=1.0)
@@ -78,13 +78,14 @@ def test_linear_int32_accumulator_sat_differs_under_hw_ref(monkeypatch):
         [x], {"weight": weight}, output_encoding, {}
     )
 
-    monkeypatch.setenv("AIMET_RX_HW_REF", "1")
-    out_hw = get_fixed_kernel(nn.Linear)(
+    monkeypatch.setenv("AIMET_RX_ACC_INT32_SAT", "0")
+    out_optout = get_fixed_kernel(nn.Linear)(
         [x], {"weight": weight}, output_encoding, {}
     )
 
-    assert out_default.int_repr.item() != out_hw.int_repr.item()
-    assert out_hw.int_repr.item() == 32_767
+    # Default now clamps to int32 max; opting out reverts to silent wrap.
+    assert out_default.int_repr.item() == 32_767
+    assert out_optout.int_repr.item() != out_default.int_repr.item()
 
 
 def test_conv2d_int16_kernel_cuda():
