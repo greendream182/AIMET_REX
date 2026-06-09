@@ -13,8 +13,9 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -27,8 +28,14 @@ from aimet_torch.fixed_point import (
     get_fixed_kernel,
     get_quant_execution_mode,
 )
+from aimet_torch.fixed_point.capabilities import (
+    KernelKind,
+    assert_requantizing_combo_supported,
+    get_capability,
+    requires_activation_bitwidth_gate,
+)
 from aimet_torch.fixed_point.encoding import InputEncoding, OutputEncoding
-from aimet_torch.fixed_point.offline.bias import quantize_bias_int32
+from aimet_torch.fixed_point.offline.bias import quantize_bias_int
 from aimet_torch.fixed_point.offline.clz_gen import (
     ClzLutGenerationError,
     clz_activation_name,
@@ -110,6 +117,52 @@ def _is_weighted_module(base_cls: type) -> bool:
     return base_cls in (nn.Linear, nn.Conv1d, nn.Conv2d)
 
 
+def _resolve_bias_bits(qmodule: Any) -> int:
+    """Pick bias storage bit-width for Conv/Linear (explicit_config).
+
+    Default is 32 (legacy/simulator). A model author opts into the spec-04_01
+    canonical 16-bit hardware bias by setting ``qmodule._fp_bias_bits = 16``
+    on the quantized module. Any other value raises so silent typos surface.
+    """
+
+    bits = getattr(qmodule, "_fp_bias_bits", 32)
+    if bits not in (16, 32):
+        raise ValueError(
+            f"_fp_bias_bits must be 16 or 32; got {bits!r} on {type(qmodule).__name__}."
+        )
+    return int(bits)
+
+
+def _maxpool_encodings_match(
+    x_int: Int16QuantizedTensor,
+    y_enc: AffineEncoding,
+) -> bool:
+    """Return True iff MaxPool input/output share the same quant grid.
+
+    Per ``doc/04_算子详细规格/04_09_池化类算子.md`` Max-pooling: hardware is a
+    comparator tree only (no ``M/rshift``); input and output must share
+    ``scale``/``zero_point``/``qmin``/``qmax``. Numerical equality is used
+    here (not Python identity), so two distinct quantizer instances that
+    converge to the same grid still match.
+    """
+
+    if x_int.qmin != y_enc.qmin or x_int.qmax != y_enc.qmax:
+        return False
+    in_scale = x_int.scale.detach().reshape(-1)
+    out_scale = y_enc.scale.detach().to(
+        device=in_scale.device, dtype=in_scale.dtype
+    ).reshape(-1)
+    if in_scale.shape != out_scale.shape or not torch.equal(in_scale, out_scale):
+        return False
+    in_zp = x_int.zero_point.detach().to(torch.int32).reshape(-1)
+    out_zp = (-y_enc.offset).detach().round().to(
+        device=in_zp.device, dtype=torch.int32
+    ).reshape(-1)
+    if in_zp.shape != out_zp.shape or not torch.equal(in_zp, out_zp):
+        return False
+    return True
+
+
 # INT16 kernels that only need output scale/zp/qmin/qmax (no MAC ``M,rshift``).
 _UNARY_GRID_ONLY_OUTPUT_OPS = frozenset(
     {
@@ -155,6 +208,47 @@ def _resolve_adaptive_avg_pool2d_output_size(
     if isinstance(output_size, (list, tuple)) and len(output_size) == 2:
         return int(output_size[0]), int(output_size[1])
     return None
+
+
+def _compute_mean_reduce_size_and_dims(
+    mean_dim, input_shape: torch.Size
+) -> tuple:
+    """Resolve ``(reduce_size, dims_resolved)`` for ``torch.mean(..., dim)``.
+
+    Single source of truth shared between the ``real_m = S_x / (N * S_y)``
+    fold (which feeds output ``M/rshift``) and the ``extra['reduce_size']``
+    contract written into the kernel ``extra``. Keeping these two values in
+    physical sync — instead of computing them in two parallel branches —
+    avoids drift bugs that would otherwise be surfaced only at runtime by
+    :func:`require_reduce_size_matches_extra`.
+
+    ``mean_dim=None`` means the full reduce; otherwise ``mean_dim`` may be
+    an ``int`` or an iterable of ``int`` and is normalised against
+    ``input_shape``'s rank with the standard ``% ndim`` wrap.
+    """
+
+    ndim = len(input_shape)
+    if mean_dim is None:
+        # ``ndim == 0`` (rank-0 scalar) would make later ``% ndim`` blow up;
+        # there's nothing to reduce in that case so return the no-op pair and
+        # let the caller's ``reduce_size <= 0`` guard refuse dispatch.
+        if ndim == 0:
+            return 0, ()
+        return int(torch.Size(input_shape).numel()), tuple(range(ndim))
+    if ndim == 0:
+        return 0, ()
+    if isinstance(mean_dim, int):
+        dims_resolved: tuple = (int(mean_dim) % ndim,)
+    else:
+        dims_resolved = tuple(int(d) % ndim for d in mean_dim)
+    reduce_size = 1
+    for d in dims_resolved:
+        reduce_size *= int(input_shape[d])
+    if reduce_size <= 0:
+        # Empty / 0-length axis: the 1/N fold is undefined; signal "no go" to
+        # the caller so it can ``return None`` and fall back to fp32 QDQ.
+        return 0, dims_resolved
+    return reduce_size, dims_resolved
 
 
 def _resolve_mean_dim_keepdim(
@@ -298,6 +392,30 @@ def _qat_surrogate_float(
         )
     if base_cls is nn.Flatten:
         return torch.flatten(surrogate_inputs[0], extra["start_dim"], extra["end_dim"])
+    if base_cls in (nn.Upsample, nn.UpsamplingNearest2d):
+        # Surrogate runs in the value space (fp32 fake-quant), so ``F.interpolate``
+        # accepts the tensor directly. Mode/size/scale_factor were captured at
+        # the ``extra``-build site below.
+        return F.interpolate(
+            surrogate_inputs[0],
+            size=extra.get("size"),
+            scale_factor=extra.get("scale_factor"),
+            mode=str(extra.get("mode", "nearest")),
+        )
+    if base_cls is nn.LayerNorm:
+        # LayerNorm surrogate is symmetric with the float-reference kernel
+        # in ``norm.LayerNormInt16Kernel`` — both call ``F.layer_norm`` on
+        # the fp32 value-space input. ``normalized_shape`` / ``eps`` /
+        # ``weight`` / ``bias`` come from ``extra`` (captured below at the
+        # extra-build site) so this branch matches the kernel byte-for-byte
+        # when fed equivalent inputs.
+        return F.layer_norm(
+            surrogate_inputs[0],
+            normalized_shape=extra["normalized_shape"],
+            weight=extra.get("weight"),
+            bias=extra.get("bias"),
+            eps=float(extra.get("eps", 1e-5)),
+        )
     if base_cls is custom.Reshape:
         return torch.reshape(surrogate_inputs[0], extra["shape"])
     if base_cls is custom.Pad:
@@ -406,6 +524,7 @@ def _broadcast_output_encoding_linear(enc: OutputEncoding, out_features: int) ->
         multiplier=mult.reshape(1, -1),
         rshift=rsh.reshape(1, -1),
         axis=enc.axis,
+        bias_bits=enc.bias_bits,
     )
 
 
@@ -432,6 +551,7 @@ def _broadcast_output_encoding_conv2d(enc: OutputEncoding, out_channels: int) ->
         multiplier=mult.reshape(1, out_channels, 1, 1),
         rshift=rsh.reshape(1, out_channels, 1, 1),
         axis=enc.axis,
+        bias_bits=enc.bias_bits,
     )
 
 
@@ -498,6 +618,84 @@ def _dispatch_sign_int16_on_float(
     return out
 
 
+def _collect_quantizer_bitwidths(
+    qmodule: nn.Module, attr: str
+) -> List[int]:
+    """Pull initialized ``bitwidth`` values from a ``nn.ModuleList`` of
+    quantizers (input / output / param). Quantizers that exist but are
+    not initialized contribute nothing to the contract — same convention
+    as the legacy gate that ``return``-ed on ``not is_initialized()``.
+    """
+
+    out: List[int] = []
+    quants = getattr(qmodule, attr, None)
+    if not isinstance(quants, (nn.ModuleList, nn.ModuleDict)):
+        return out
+    iterator = (
+        quants.values() if isinstance(quants, nn.ModuleDict) else iter(quants)
+    )
+    for quant in iterator:
+        if not isinstance(quant, QuantizerBase) or not quant.is_initialized():
+            continue
+        bw = getattr(quant, "bitwidth", None)
+        if bw is None:
+            continue
+        out.append(int(bw))
+    return out
+
+
+def _enforce_supported_activation_bitwidths(
+    qmodule: nn.Module, base_cls: type
+) -> None:
+    """Refuse REQUANTIZING-kernel dispatch on an unvalidated bitwidth combo.
+
+    PR-2 (W5 SYS-FU-1.B) routes the gate through
+    :func:`assert_requantizing_combo_supported`: instead of asserting each
+    activation bitwidth in isolation, the gate now collects the full
+    operand set (input quantizers, output quantizers, weight param
+    quantizer) and validates the ``input_bw + weight_bw`` combo against
+    :data:`REQUANTIZING_COMBO_BITWIDTH_BUDGET` for kernels with
+    ``cap.is_reduction=True`` (Conv/Linear/MatMul). Element-wise
+    REQUANTIZING ops (Multiply/Divide/cross-grid Add/Subtract — N=1) and
+    sum-only reduction ops (AvgPool/Mean/LayerNorm — no operand×operand
+    MAC) bypass the budget but still require each bitwidth to be in
+    :data:`SUPPORTED_ACTIVATION_BITWIDTHS`.
+
+    Bias quantizers stay out of the contract (``bias_bits ∈ {16,32}`` is
+    enforced by the kernel/offline path independently).
+    """
+
+    capability = get_capability(base_cls)
+    if capability is None or not requires_activation_bitwidth_gate(
+        capability.kernel_kind
+    ):
+        return
+
+    qualname = type(qmodule).__name__
+
+    input_bws = _collect_quantizer_bitwidths(qmodule, "input_quantizers")
+    output_bws = _collect_quantizer_bitwidths(qmodule, "output_quantizers")
+
+    weight_bws: List[int] = []
+    param_q = getattr(qmodule, "param_quantizers", None)
+    if isinstance(param_q, nn.ModuleDict) and "weight" in param_q:
+        wq = param_q["weight"]
+        if (
+            isinstance(wq, QuantizerBase)
+            and wq.is_initialized()
+            and getattr(wq, "bitwidth", None) is not None
+        ):
+            weight_bws.append(int(wq.bitwidth))
+
+    assert_requantizing_combo_supported(
+        input_bws + output_bws,
+        weight_bws,
+        where="input/output/weight quantizers",
+        qualname=qualname,
+        is_reduction=bool(capability.is_reduction),
+    )
+
+
 def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[Int16QuantizedTensor, torch.Tensor]]:
     """Run the module on INT16 fixed-point kernels when execution mode allows.
 
@@ -543,6 +741,22 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
     if base_cls is None:
         return None
 
+    # Activation bitwidth contract gate: REQUANTIZING kernels (Linear, Conv,
+    # AvgPool, Mean, ...) are validated only at the activation bitwidths
+    # declared in ``capabilities.SUPPORTED_ACTIVATION_BITWIDTHS``. LOOKUP
+    # kernels (sigmoid/sin/sqrt/...) are gated separately by their LUT/CLZ
+    # generators, which DO support 16-bit activations, so the helper
+    # consults the manifest and skips them. We refuse loudly here rather
+    # than ``return None``-ing so callers see a precise error instead of
+    # either a generic "not implemented" or — worse — a silent dispatch
+    # that produces an arithmetic-but-wrong result (>2k LSB drift on
+    # Linear / AvgPool / Mean was the original repro). QAT_SIM runs
+    # through a float surrogate path with different numerics and is
+    # intentionally not gated here; see
+    # audit-int16-activation-quantizer-contract.
+    if mode is ExecutionMode.INT16_FIXED_EVAL:
+        _enforce_supported_activation_bitwidths(qmodule, base_cls)
+
     # Shape/layout metadata (e.g. b*f from tensor.shape for view) is not a
     # quantized activation segment; evaluate with plain scalar semantics.
     from aimet_torch.fixed_point.shape_meta import try_dispatch_shape_meta_op
@@ -572,17 +786,28 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
         return None
 
     if base_cls is custom.ElementwiseUnarySign:
-        sign_out = _dispatch_sign_int16_on_float(
-            qmodule,
-            args,
-            kwargs,
-            device=device,
-            mode=mode,
-            collect_surrogate=collect_surrogate,
-            int_value_ctx=int_value_ctx,
+        # pylint: disable=import-outside-toplevel
+        from aimet_torch.fixed_point.requantize import (
+            _forbid_float_fallback_in_eval,
+            int16_fixed_eval_mode,
+            sign_float_ref_enabled,
         )
-        if sign_out is not None:
-            return sign_out
+
+        if kwargs.get("sign_float_ref") and int16_fixed_eval_mode():
+            _forbid_float_fallback_in_eval("sign_float_ref")
+        use_float_sign = collect_surrogate or sign_float_ref_enabled()
+        if use_float_sign:
+            sign_out = _dispatch_sign_int16_on_float(
+                qmodule,
+                args,
+                kwargs,
+                device=device,
+                mode=mode,
+                collect_surrogate=collect_surrogate,
+                int_value_ctx=int_value_ctx,
+            )
+            if sign_out is not None:
+                return sign_out
 
     pq = getattr(qmodule, "param_quantizers", None)
     wq = pq["weight"] if pq is not None and "weight" in pq else None
@@ -690,6 +915,31 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                         "ceil_mode": qmodule.ceil_mode,
                     }
                 )
+            elif isinstance(qmodule, (nn.Upsample, nn.UpsamplingNearest2d)):
+                # QAT-side surrogate uses the same ``F.interpolate`` branch as
+                # the fp32-eval surrogate above; mirror the same extra keys so
+                # the surrogate fp32 path matches the int16 dispatch path.
+                mode_attr = getattr(qmodule, "mode", "nearest")
+                qat_extra.update(
+                    {
+                        "mode": str(mode_attr) if mode_attr is not None else "nearest",
+                        "size": getattr(qmodule, "size", None),
+                        "scale_factor": getattr(qmodule, "scale_factor", None),
+                    }
+                )
+            elif isinstance(qmodule, nn.LayerNorm):
+                # γ/β are nn.LayerNorm's native fp32 parameters (only present
+                # when ``elementwise_affine=True``). For the QAT surrogate
+                # they go in as fp32 directly — no separate quantization,
+                # matching ``LayerNormInt16Kernel`` semantics.
+                qat_extra.update(
+                    {
+                        "normalized_shape": tuple(qmodule.normalized_shape),
+                        "eps": float(getattr(qmodule, "eps", 1e-5)),
+                        "weight": getattr(qmodule, "weight", None),
+                        "bias": getattr(qmodule, "bias", None),
+                    }
+                )
             surrogate = _run_qat_surrogate(
                 qmodule, base_cls, surrogate_inputs, {}, qat_extra
             )
@@ -720,6 +970,7 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
 
     if _is_weighted_module(base_cls):
         w_float = qmodule.weight
+        bias_bits = _resolve_bias_bits(qmodule)
         with int_value_ctx:
             w_int = quantize_boundary_from_affine(w_float, w_enc).to(device)
             params["weight"] = w_int
@@ -732,14 +983,19 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                     ones = torch.ones_like(
                         acc_scale, dtype=acc_scale.dtype, device=acc_scale.device
                     )
-                    params["bias"] = quantize_bias_int32(bias, acc_scale, ones)
+                    params["bias"] = quantize_bias_int(
+                        bias, acc_scale, ones, bits=bias_bits
+                    )
                 else:
-                    params["bias"] = quantize_bias_int32(bias, x_scale, w_enc.scale)
+                    params["bias"] = quantize_bias_int(
+                        bias, x_scale, w_enc.scale, bits=bias_bits
+                    )
 
         w_scale = w_enc.scale.to(device=device, dtype=torch.float32)
         y_scale = y_enc.scale.to(device=device, dtype=torch.float32)
         real_m = (x_scale * w_scale) / y_scale
         out_enc = _affine_output_encoding(y_enc, real_m, device)
+        out_enc = dataclasses.replace(out_enc, bias_bits=bias_bits)
         if base_cls is nn.Linear:
             out_enc = _broadcast_output_encoding_linear(out_enc, w_float.shape[0])
         elif base_cls in (nn.Conv1d, nn.Conv2d):
@@ -762,7 +1018,33 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                 inputs_int[0].scale.to(device=device, dtype=torch.float32)
                 / inputs_int[1].scale.to(device=device, dtype=torch.float32)
             ) / y_scale
+        elif base_cls is nn.MaxPool2d:
+            # Spec doc/04_算子详细规格/04_09_池化类算子.md §Max-pooling:
+            # comparator tree only, no ``M/rshift``; input/output share the
+            # same quant grid. Refuse dispatch when encodings disagree to fall
+            # back to float QDQ instead of silently rewrapping with a different
+            # scale/zero-point. Sentinel handled below: skip
+            # ``_output_encoding_from_scales`` when ``real_m`` is ``None``.
+            if not _maxpool_encodings_match(x_int, y_enc):
+                return None
+            out_enc = _affine_to_fixed_encoding(y_enc, device)
+            real_m = None
         elif base_cls is nn.AvgPool2d:
+            # Spec 04_09 only models ``count_include_pad=True`` (the divisor
+            # is fixed at ``k_t * k_f``). ``count_include_pad=False`` would
+            # mean a per-window divisor that the HW does not support; refuse
+            # dispatch so the op falls back to the float QDQ path instead of
+            # producing a silently mis-scaled result.
+            #
+            # Note: this guard is intentionally configuration-level rather
+            # than padding-aware. ``count_include_pad=False`` with
+            # ``padding=0`` is numerically equivalent to the spec path, but
+            # we still refuse dispatch to keep the rule trivially auditable
+            # ("the only supported AvgPool2d config is the spec-04_09 fold")
+            # at the cost of occasionally falling back to fp32 QDQ for a
+            # config the math would have allowed.
+            if not getattr(qmodule, "count_include_pad", True):
+                return None
             kernel_size = qmodule.kernel_size
             if isinstance(kernel_size, tuple):
                 kernel_area = int(kernel_size[0]) * int(kernel_size[1])
@@ -772,17 +1054,9 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
         elif base_cls is custom.Mean:
             # ``torch.mean(x, dim, keepdim=...)``: forward args[1:] / kwargs carry dim/keepdim.
             mean_dim, mean_keepdim = _resolve_mean_dim_keepdim(args, kwargs, x_int.int_repr.shape)
-            if mean_dim is None:
-                reduce_size = int(x_int.int_repr.numel())
-                dims_resolved: tuple[int, ...] = tuple(range(x_int.int_repr.dim()))
-            else:
-                if isinstance(mean_dim, int):
-                    dims_resolved = (int(mean_dim) % x_int.int_repr.dim(),)
-                else:
-                    dims_resolved = tuple(int(d) % x_int.int_repr.dim() for d in mean_dim)
-                reduce_size = 1
-                for d in dims_resolved:
-                    reduce_size *= int(x_int.int_repr.shape[d])
+            reduce_size, _ = _compute_mean_reduce_size_and_dims(
+                mean_dim, x_int.int_repr.shape
+            )
             if reduce_size <= 0:
                 return None
             real_m = x_scale / (float(reduce_size) * y_scale)
@@ -802,9 +1076,10 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             real_m = x_scale / (float(reduce_size) * y_scale)
         else:
             real_m = x_scale / y_scale
-        out_enc = _output_encoding_from_scales(
-            y_enc, real_m, device, base_cls=base_cls
-        )
+        if real_m is not None:
+            out_enc = _output_encoding_from_scales(
+                y_enc, real_m, device, base_cls=base_cls
+            )
 
     extra: Dict[str, Any]
     if isinstance(qmodule, nn.Conv2d):
@@ -835,6 +1110,40 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
             extra["value"] = 0.0 if pad_value is None else float(pad_value)
         elif isinstance(qmodule, custom.Concat):
             extra["axis"] = getattr(qmodule, "_axis", getattr(qmodule, "axis", 0))
+        elif isinstance(qmodule, (nn.Upsample, nn.UpsamplingNearest2d)):
+            # ``nn.Upsample`` accepts EITHER ``size`` (explicit output spatial
+            # shape) OR ``scale_factor`` (multiplier on input shape); exactly
+            # one is set on the module. Mode defaults to ``nearest`` for
+            # ``UpsamplingNearest2d`` and is whatever was passed for
+            # ``Upsample``; the kernel rejects non-nearest modes so the
+            # adapter does NOT pre-filter here.
+            mode_attr = getattr(qmodule, "mode", "nearest")
+            extra.update(
+                {
+                    "mode": str(mode_attr) if mode_attr is not None else "nearest",
+                    "size": getattr(qmodule, "size", None),
+                    "scale_factor": getattr(qmodule, "scale_factor", None),
+                }
+            )
+        elif isinstance(qmodule, nn.LayerNorm):
+            # Spec doc/04_算子详细规格/04_05_归一化类算子.md §4.5.4. The
+            # float-reference kernel at ``norm.LayerNormInt16Kernel`` takes
+            # ``normalized_shape`` / ``eps`` / ``weight`` (γ) / ``bias`` (β)
+            # from this ``extra`` dict and feeds them straight into
+            # ``F.layer_norm``. γ/β remain fp32 here (not quantized along
+            # the activation grid) — they are nn.LayerNorm's native fp32
+            # parameters and the kernel consumes them directly. The spec
+            # big-op variant would quantize γ/β to integer M/rshift coefs
+            # at compile time, but that path is the dedicated DSP kernel
+            # tracked under ``FU-LAYERNORM-DSP-PARITY``.
+            extra.update(
+                {
+                    "normalized_shape": tuple(qmodule.normalized_shape),
+                    "eps": float(getattr(qmodule, "eps", 1e-5)),
+                    "weight": getattr(qmodule, "weight", None),
+                    "bias": getattr(qmodule, "bias", None),
+                }
+            )
         elif isinstance(qmodule, (nn.MaxPool2d, nn.AvgPool2d)):
             extra.update(
                 {
@@ -845,11 +1154,23 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                     "ceil_mode": qmodule.ceil_mode,
                 }
             )
+            if isinstance(qmodule, nn.AvgPool2d):
+                # Spec 04_09 folds ``1/N`` (N = k_t * k_f) into the offline
+                # ``M/rshift`` stream; the kernel re-derives N from
+                # ``kernel_size`` and asserts it matches this value, so any
+                # adapter path that forgets the fold surfaces immediately.
+                ks = qmodule.kernel_size
+                if isinstance(ks, tuple):
+                    extra["reduce_size"] = int(ks[0]) * int(ks[1])
+                else:
+                    extra["reduce_size"] = int(ks) * int(ks)
         elif isinstance(qmodule, nn.Hardtanh):
             scale = x_int.scale.to(device=device, dtype=torch.float32)
             zp = x_int.zero_point.to(device=device, dtype=torch.int32)
             extra.update(
                 {
+                    "min": float(qmodule.min_val),
+                    "max": float(qmodule.max_val),
                     "min_int": int(torch.round(torch.tensor(qmodule.min_val, device=device) / scale + zp).item()),
                     "max_int": int(torch.round(torch.tensor(qmodule.max_val, device=device) / scale + zp).item()),
                 }
@@ -871,11 +1192,37 @@ def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[
                 extra["max_int"] = int(x_int.qmax)
         elif base_cls is custom.Mean:
             mean_dim, mean_keepdim = _resolve_mean_dim_keepdim(args, kwargs, x_int.int_repr.shape)
-            extra.update({"dim": mean_dim, "keepdim": mean_keepdim})
+            # ``reduce_size`` shares its source of truth with the ``1/N``
+            # fold above (``_compute_mean_reduce_size_and_dims``), so
+            # ``M/rshift`` and the kernel-side contract cannot drift apart.
+            mean_reduce_size, _ = _compute_mean_reduce_size_and_dims(
+                mean_dim, x_int.int_repr.shape
+            )
+            # The ``real_m`` branch above already returns None on
+            # ``reduce_size <= 0``; this mirror-guard keeps the two branches
+            # symmetric so that a future re-ordering of dispatch stages does
+            # not silently produce ``extra['reduce_size'] = 0``.
+            if mean_reduce_size <= 0:
+                return None
+            extra.update(
+                {
+                    "dim": mean_dim,
+                    "keepdim": mean_keepdim,
+                    "reduce_size": mean_reduce_size,
+                }
+            )
         elif base_cls is custom.AdaptiveAvgPool2d:
             # ``output_size=(1,1)`` is the only path that reaches dispatch (see above);
             # the Mean kernel reduces the spatial dims with ``keepdim=True``.
-            extra.update({"dim": (2, 3), "keepdim": True, "output_size": (1, 1)})
+            shape = x_int.int_repr.shape
+            extra.update(
+                {
+                    "dim": (2, 3),
+                    "keepdim": True,
+                    "output_size": (1, 1),
+                    "reduce_size": int(shape[2]) * int(shape[3]),
+                }
+            )
         elif base_cls is nn.Softmax:
             extra["dim"] = getattr(qmodule, "dim", None)
             if extra["dim"] is None:

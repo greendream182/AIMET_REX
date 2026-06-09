@@ -83,13 +83,22 @@ __all__ = [
 #
 # The dispatch entry consults the manifest to decide whether to enforce, so
 # this single tuple intentionally only covers the REQUANTIZING contract.
-SUPPORTED_ACTIVATION_BITWIDTHS: Tuple[int, ...] = (8,)
-"""Activation bitwidths validated for **REQUANTIZING** kernels under
-``INT16_FIXED_EVAL``. Held as a tuple-of-ints rather than a hard ``== 8``
-comparison so adding a freshly validated bitwidth (e.g. once the
-multiplier/rshift path is fixed for 16-bit) is a one-line manifest change
-instead of a scattered branch hunt. LOOKUP / SAME_GRID kernels are NOT
-gated by this set; see the per-kind contract above.
+SUPPORTED_ACTIVATION_BITWIDTHS: Tuple[int, ...] = (8, 16)
+"""Per-operand activation bitwidths validated for **REQUANTIZING**
+kernels under ``INT16_FIXED_EVAL``.
+
+W5 SYS-FU-1.B (PR-2, 2026-06-09) extended the legacy ``(8,)`` to
+``(8, 16)`` after the W5.1 probe showed the asymmetric subset
+``16+8 / 8+16`` is safe (SQNR ≥ 39 dB up to N=4096). The remaining
+``16+16``-on-MAC-reduction case (Conv/Linear/MatMul) is gated
+separately by :func:`assert_requantizing_combo_supported` against
+:data:`REQUANTIZING_COMBO_BITWIDTH_BUDGET`. Element-wise REQUANTIZING
+ops (Multiply/Divide/cross-grid Add/Subtract — N=1) and sum-only
+reduction ops (AvgPool/Mean/LayerNorm — no operand×operand MAC)
+accept the full ``16+16`` because the int32 ALU never reduces them.
+
+LOOKUP / SAME_GRID kernels are NOT gated by this set; see the
+per-kind contract above.
 """
 
 
