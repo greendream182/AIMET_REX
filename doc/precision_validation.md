@@ -290,6 +290,30 @@
     + 路径 2（per-channel activation 实验），不能再期待 calib 调整
     解决
 
+#### SYS-OPEN-Q-1 part A 工程闭合（commit 紧随 W6 探索）
+
+- `examples/quick_start_int16_metric.py` 引入常量
+  `SYSQ1_W6_PERCENTILE_VALUE = 99.5`，并把
+  `--percentile-value` argparse 默认从 upstream `PERCENTILE_VALUE`
+  (`quick_start.py` 中的 99.99) 切到该常量。CLI 仍允许传入任意值，
+  仅默认行为下让 SYS-OPEN-Q-1 part A 自动 mitigate。
+- 守护测试：`tests/fixed_point/test_quick_start_int16_metric_defaults.py`
+  以源码字符串方式锁住两点（避开 example 包结构 import 的重型依赖）：
+  1. 模块顶层定义 `SYSQ1_W6_PERCENTILE_VALUE = 99.5`
+  2. argparse `--percentile-value` 的 `default` 字面量等于
+     `SYSQ1_W6_PERCENTILE_VALUE`（不是 `PERCENTILE_VALUE`）
+- 重型 integration regression（实际跑 metric pipeline 校验受益 layer
+  SQNR 下限）留作 SYS-FU-2 工单跟进（每跑约 ~40 s，不适合作为 unit
+  test 默认强制项）。
+- **acceptance config 不变**：本闭合只动 INT16 metric script 的默认
+  calib，`mrnn_acceptance_mixed_precision.json` 自身（bitwidth-config）
+  无关；用户跑 `quick_start_int16_metric.py` 不显式传
+  `--quant-scheme`/`--percentile-value` 时即获得 W6 mitigation。
+- 验证：smoke run 确认输出 banner "Quant scheme: percentile
+  percentile=99.5"，`fc0` SQNR 13.02 dB / cos 0.979、
+  `freq_downs.2.conv2d` cos 0.918、`neck_seqs.1.conv_t` cos 0.911
+  与 W6 sweep 数字精确一致。
+
 ## SYS-LIMIT-2: R2 grid-aware floor 与 fp32 EPS 语义差
 
 详见 `nn.Hardtanh / custom.Clamp / custom.Clip` 章节

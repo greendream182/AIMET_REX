@@ -101,6 +101,24 @@ from aimet_torch.utils_rx import freeze_quantizer_parameters  # noqa: E402
 _HERE = Path(__file__).resolve().parent
 ACCEPTANCE_BITWIDTH_CONFIG = _HERE / "config" / "mrnn_acceptance_mixed_precision.json"
 DEFAULT_MAX_CALIB_BATCHES = 100
+
+# SYS-OPEN-Q-1 W6 (2026-06-09 commit 78fffef): default calib percentile
+# overrides the upstream educational default (99.99 in `quick_start.py`).
+#
+# W6 sweep on `quick_start_full_quant.json` 8bit baseline showed:
+# - 99.5 unblocks SYS-OPEN-Q-1 part A: fc0 SQNR 5.34 -> 13.02 dB
+#   (+7.7 dB), cos 0.873 -> 0.979; freq_downs.2.conv2d cos 0.776 ->
+#   0.918; neck_seqs.1.conv_t cos 0.844 -> 0.911.
+# - 99.0 partially regresses some layers (e.g. enc_seqs.0.conv_t cos
+#   0.915 -> 0.882). 99.5 is the local optimum across the swept set.
+# - tf / tf_enhanced behave like 99.99 baseline (non-outlier paths
+#   dominate). part B (freq_downs.0/1, neck_seqs.0, enc_seqs.0/1)
+#   is unaffected by calib and tracked separately.
+#
+# CLI `--percentile-value` still accepts any float; this just changes
+# the default users get when they omit the flag, so SYS-OPEN-Q-1 part A
+# is mitigated by default in the INT16 metric script.
+SYSQ1_W6_PERCENTILE_VALUE = 99.5
 _QDQ_MODE_VALUES = frozenset({
     ExecutionMode.FP32_QDQ.value,
     ExecutionMode.FP16_QDQ.value,
@@ -884,8 +902,12 @@ def main() -> None:
     parser.add_argument(
         "--percentile-value",
         type=float,
-        default=PERCENTILE_VALUE,
-        help="percentile scheme 分位点（仅 quant_scheme=percentile 时生效）",
+        default=SYSQ1_W6_PERCENTILE_VALUE,
+        help=(
+            "percentile scheme 分位点（仅 quant_scheme=percentile 时生效）；"
+            f"默认 {SYSQ1_W6_PERCENTILE_VALUE}（SYS-OPEN-Q-1 W6 推荐值，"
+            f"vs upstream 通用 99.99）"
+        ),
     )
     parser.add_argument(
         "--apply-po2",
