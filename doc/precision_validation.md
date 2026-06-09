@@ -248,6 +248,48 @@
   4. 若 1-3 都不能拉起，再考虑 frontend 重设计或 STFT-domain 输出
      channel-wise scale 表达
 
+### SYS-OPEN-Q-1 W6 探索（2026-06-09）：calib percentile sweep 把 SYS-OPEN-Q-1 拆成 part A + part B
+
+- **方法**：`quick_start_full_quant.json` 8bit baseline 不变，扫
+  4 个 calib scheme × 8 个 backbone Conv/ConvT/Linear 节点的
+  isolated SQNR / cosine：
+
+  | module | tf | tf_enhanced | percentile=99.99 (baseline) | percentile=99.5 | percentile=99.0 |
+  |---|---|---|---|---|---|
+  | `freq_downs.0.conv2d` | 0.901 / 5.21 | 0.902 / 5.18 | 0.901 / 5.21 | 0.875 / 4.31 | 0.871 / 3.55 |
+  | `freq_downs.1.conv2d` | 0.818 / 1.63 | 0.813 / 1.53 | 0.818 / 1.58 | 0.839 / 1.57 | 0.843 / 1.56 |
+  | `freq_downs.2.conv2d` | 0.764 / 2.86 | 0.765 / 2.87 | 0.776 / 3.07 | **0.918 / 4.73** | **0.919 / 4.69** |
+  | `neck_seqs.0.conv_t` | 0.847 / 2.30 | 0.846 / 2.30 | 0.848 / 2.26 | 0.861 / 2.36 | 0.834 / 2.09 |
+  | `neck_seqs.1.conv_t` | 0.832 / 3.53 | 0.839 / 3.71 | 0.844 / 3.74 | **0.911 / 5.67** | 0.888 / 4.38 |
+  | `enc_seqs.0.conv_t` | 0.915 / 4.89 | 0.916 / 5.02 | 0.915 / 4.93 | 0.914 / 4.89 | 0.882 / 3.85 |
+  | `enc_seqs.1.conv_t` | 0.888 / 2.60 | 0.887 / 2.64 | 0.889 / 2.60 | 0.918 / 2.22 | 0.921 / 2.16 |
+  | `fc0` | 0.864 / 5.04 | 0.872 / 5.27 | 0.873 / 5.34 | **0.979 / 13.02** | **0.976 / 11.96** |
+
+  （`min_max` 在 v2 quantsim 不被支持，已自然排除）
+- **关键 finding：SYS-OPEN-Q-1 不是单一根因，可分解为两块**：
+  - **part A — outlier-driven calib scale 偏差（可立即缓解）**：
+    `fc0` / `freq_downs.2.conv2d` / `neck_seqs.1.conv_t` 三个节点
+    在 `percentile=99.5` 下 SQNR 显著拉起（`fc0` +7.7 dB，`fc0`
+    cosine 0.873 → **0.979**；`freq_downs.2` cos 0.776 → **0.918**；
+    `neck_seqs.1` cos 0.844 → **0.911**）。说明 99.99 percentile 把
+    activation long-tail outlier 拉满了，scale 被顶上去导致 grid
+    浪费在 outlier 上、有效区域 step 变粗
+  - **part B — second factor（未解）**：剩下 5 个节点
+    （`freq_downs.0.conv2d`、`freq_downs.1.conv2d`、`neck_seqs.0.conv_t`、
+    `enc_seqs.0.conv_t`、`enc_seqs.1.conv_t`）在所有 calib 下 SQNR
+    波动 ≤ 1 dB，cosine 0.83-0.92 不变。**不是 outlier 主导**，
+    多半是 per-tensor activation grid resolution + multi-mode /
+    低幅 channel 占多数模式（已记录在「可能的方向」第 1 / 3 条）
+- **建议处置**：
+  - **part A**：作为 SYS-FU-2 的 quick win，在 acceptance / CI
+    config 中把 `quant_scheme=percentile` + `percentile_value=99.5`
+    定为推荐配置（注意：`percentile=99.0` 部分 layer 反而退步，
+    例如 `enc_seqs.0.conv_t` cos 0.915 → 0.882，`neck_seqs.1` cos
+    0.911 → 0.888；99.5 是当前数据中的局部最优）
+  - **part B**：仍走原 SYS-FU-2 诊断路径 1（activation 分布 dump）
+    + 路径 2（per-channel activation 实验），不能再期待 calib 调整
+    解决
+
 ## SYS-LIMIT-2: R2 grid-aware floor 与 fp32 EPS 语义差
 
 详见 `nn.Hardtanh / custom.Clamp / custom.Clip` 章节
