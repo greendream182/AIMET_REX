@@ -198,19 +198,29 @@ def diagnose_int16_readiness(sim: Any) -> Report:
                         and getattr(wq, "bitwidth", None) is not None
                     ):
                         weight_bws.append(int(wq.bitwidth))
+                # Same input/weight vs output split as the adapter; see
+                # the long comment there for why output_bw is NOT a MAC
+                # operand.
+                gate_failed = False
                 try:
                     assert_requantizing_combo_supported(
-                        input_bws + output_bws,
+                        input_bws,
                         weight_bws,
-                        where="input/output/weight quantizers",
+                        where="input/weight quantizers",
                         qualname=type(module).__name__,
                         is_reduction=bool(cap_for_gate.is_reduction),
                     )
+                    if output_bws:
+                        assert_requantizing_combo_supported(
+                            output_bws,
+                            (),
+                            where="output quantizers",
+                            qualname=type(module).__name__,
+                            is_reduction=False,
+                        )
                 except ValueError:
-                    # Surface the highest operand bitwidth as the offending
-                    # value (matches the legacy report shape; deeper details
-                    # live in the exception message that the adapter raises
-                    # at forward time).
+                    gate_failed = True
+                if gate_failed:
                     bws_all = input_bws + output_bws + weight_bws
                     if bws_all:
                         unsupported_activation_bitwidth.append(

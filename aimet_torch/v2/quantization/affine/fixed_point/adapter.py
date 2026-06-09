@@ -687,13 +687,32 @@ def _enforce_supported_activation_bitwidths(
         ):
             weight_bws.append(int(wq.bitwidth))
 
+    # The combo gate runs on the operands carrying the MAC reduction
+    # — for Conv/Linear those are ``inputs × weights``; for MatMul they
+    # are ``inputs × inputs``. The OUTPUT bitwidth is the requantize
+    # target grid, NOT a MAC operand, so feeding it as a phantom
+    # "input" would build a false ``(output_bw, weight_bw)`` pair and
+    # spuriously trip the 16+16 budget on legitimate combos like
+    # ``input=8, weight=16, output=16`` (where the only real MAC pair
+    # is ``8+16=24`` ≤ budget). We therefore:
+    #   * pass ``input_bws`` + ``weight_bws`` to the budget check, and
+    #   * sanity-check each ``output_bw`` independently via the
+    #     bitwidth-list half of the same gate.
     assert_requantizing_combo_supported(
-        input_bws + output_bws,
+        input_bws,
         weight_bws,
-        where="input/output/weight quantizers",
+        where="input/weight quantizers",
         qualname=qualname,
         is_reduction=bool(capability.is_reduction),
     )
+    if output_bws:
+        assert_requantizing_combo_supported(
+            output_bws,
+            (),
+            where="output quantizers",
+            qualname=qualname,
+            is_reduction=False,
+        )
 
 
 def dispatch_int16_fixed(qmodule: nn.Module, *args, **kwargs) -> Optional[Union[Int16QuantizedTensor, torch.Tensor]]:
