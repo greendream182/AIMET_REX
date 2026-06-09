@@ -68,11 +68,20 @@ __all__ = [
 # activation grid. The activation-bitwidth contract is **per** :class:`KernelKind`:
 #
 #   * ``REQUANTIZING`` (Linear / Conv / AvgPool / Mean / MatMul / Mul / Divide):
-#     only 8-bit activations are validated today. 16-bit activations on these
-#     ops produce >2k LSB drift vs. FP32_QDQ — the offline ``M/rshift`` path
-#     was tuned for 8-bit grids and the multiplier/rshift/carrier edges are
-#     not safe at 16-bit (root cause TBD; tracked under the
-#     audit-int16-activation-quantizer-contract follow-up).
+#     two-tier contract since W5 SYS-FU-1.B (RESOLVED 2026-06-09;
+#     see ``doc/precision_validation.md`` SYS-LIMIT-1):
+#       1. Each operand bitwidth must be in ``SUPPORTED_ACTIVATION_BITWIDTHS``
+#          (currently ``(8, 16)``), validated at the per-quantizer level.
+#       2. For kernels with ``OperatorCapability.is_reduction = True`` (i.e.
+#          MAC-summing ops Conv / Linear / MatMul), the operand pair carrying
+#          the MAC must additionally satisfy
+#          ``input_bw + weight_bw ≤ REQUANTIZING_COMBO_BITWIDTH_BUDGET``
+#          (= 24). The W5.1 root-cause probe established this is the budget
+#          that keeps the INT32 ALU from saturating; ``16+16`` exceeds it
+#          and is rejected with a precise ``REQUANTIZING-with-MAC-reduction``
+#          ValueError. Element-wise / sum-only ops (Multiply / Divide /
+#          AvgPool / Mean / LayerNorm) skip the budget because their MAC
+#          carrier never exceeds ±2^31.
 #   * ``LOOKUP`` (sigmoid / tanh / sin / cos / sqrt / rsqrt / reciprocal /
 #     square / log / exp / softmax / mish / ...): 16-bit activations are
 #     validated and exercised by the existing ``test_quantized_*_int16_*``
@@ -81,8 +90,10 @@ __all__ = [
 #     output share encoding, so the activation bitwidth is whatever the
 #     producer hands in — no separate gate needed here.
 #
-# The dispatch entry consults the manifest to decide whether to enforce, so
-# this single tuple intentionally only covers the REQUANTIZING contract.
+# The dispatch entry (``adapter._enforce_supported_activation_bitwidths``)
+# consults the manifest to apply both tiers; ``diagnose_int16_readiness``
+# mirrors the same check so a forward pass and a readiness pass cannot
+# disagree on what counts as a valid combo.
 SUPPORTED_ACTIVATION_BITWIDTHS: Tuple[int, ...] = (8, 16)
 """Per-operand activation bitwidths validated for **REQUANTIZING**
 kernels under ``INT16_FIXED_EVAL``.

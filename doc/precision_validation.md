@@ -44,53 +44,101 @@
 图角度才能看清的精度天花板。每条都附"诊断指引"，帮助后续 reviewer
 在碰到相同症状时快速识别根因，避免重复探索。
 
-## SYS-LIMIT-1: REQUANTIZING 16-bit×16-bit MAC 触发 INT32 ALU 饱和（W5.1 已诊断）
+## SYS-LIMIT-1: REQUANTIZING 16-bit×16-bit MAC 触发 INT32 ALU 饱和（**RESOLVED with combo contract — 2026-06-09，SYS-FU-1.B**）
 
-- **契约位置**: `aimet_torch/fixed_point/capabilities.py::SUPPORTED_ACTIVATION_BITWIDTHS = (8,)`
-- **守护测试**: `tests/fixed_point/test_v2_int16_adapter.py::test_int16_fixed_eval_refuses_unsupported_activation_bitwidth`
-- **覆盖 op**: 所有 `KernelKind.REQUANTIZING` —— `Linear` / `Conv*` /
-  `MatMul` / `Multiply` / `Divide` / `AvgPool` / `Mean` / `LayerNorm` /
-  `Add`(cross-grid) / `Subtract`(cross-grid)
-- **真因**: HW spec 的 INT32 ALU 限制（`saturate_mac_accumulator` /
-  `require_int32_saturated_accumulator` 强制契约）：
+- **契约位置（更新后）**:
+  - `aimet_torch/fixed_point/capabilities.py::SUPPORTED_ACTIVATION_BITWIDTHS = (8, 16)`
+    （per-operand 验证集）
+  - `aimet_torch/fixed_point/capabilities.py::REQUANTIZING_COMBO_BITWIDTH_BUDGET = 24`
+    （MAC-reduction 组合上限：`input_bw + weight_bw ≤ 24`）
+  - `aimet_torch/fixed_point/capabilities.py::OperatorCapability.is_reduction`
+    （区分 Conv/Linear/MatMul 的 MAC 求和归约 vs Multiply/Divide
+    的 element-wise / AvgPool/Mean 的 sum-only 归约）
+- **守护测试（更新后）**:
+  - `tests/fixed_point/test_v2_int16_adapter.py::test_int16_fixed_eval_refuses_full_16bit_reduction`
+    —— 16+16 MAC 组合必拒
+  - `tests/fixed_point/test_v2_int16_adapter.py::test_quantized_linear_int16_fixed_combo_gate_rejects[W4A8/W4A16/W16A16]`
+    —— 4-bit weight、16+16 reduction 必拒
+  - `tests/fixed_point/test_v2_int16_adapter.py::test_avgpool2d_full_16bit_dispatch_succeeds`
+    —— sum-only reduction 16+16 必通
+  - `tests/fixed_point/test_v2_int16_adapter.py::test_linear_asymmetric_16bit_dispatch_succeeds`
+    —— 16+8 子集必通
+  - `tests/fixed_point/test_w5_combo_probe_regression.py` —— W5.1 矩阵
+    冻结：所有 9 个 `combo × N` case dispatch + 3 个 W16A16 拒
+- **覆盖 op**: 所有 `KernelKind.REQUANTIZING`
+  - **MAC-reduction（is_reduction=True）**: `Linear` / `Conv*` /
+    `MatMul` —— 受 24-bit combo budget 约束，16+16 永远拒
+  - **Element-wise / sum-only（is_reduction=False）**: `Multiply` /
+    `Divide` / `Add`(cross-grid) / `Subtract`(cross-grid) —— 单 MAC，
+    无 N 累加，16+16 通过；`AvgPool` / `Mean` / `LayerNorm` —— sum-only
+    reduction（无 operand×operand），16+16 通过
+- **真因**（保持不变）: HW spec 的 INT32 ALU 限制
+  （`saturate_mac_accumulator` / `require_int32_saturated_accumulator`
+  强制契约）：
   - 8bit×8bit 单 MAC `±2^14`，`N=2^17` 才接近 int32 边界 → 大部分层安全
   - 16bit×16bit 单 MAC `±2^30`，`N=2` 已饱和 → 大 N 系统性丢高位信息
-
-  这就是 capabilities 注释里 ">2k LSB drift" 的真因。
+  - 16bit×8bit / 8bit×16bit 单 MAC `±2^22`，`N=2^9` 才接近边界
+    → SYS-FU-1.B 在 `N ≤ 4096` 内全程安全（probe 验证）
 - **W5.1 probe 数据快照**（2026-06-09 ad-hoc，`LinearInt16Kernel`，
-  B=8, M=16, random fp32 input/weight；脚本未入库，按下表数据可
-  随时复现）:
+  B=8, M=16, random fp32 input/weight；probe 脚本未入库，但矩阵
+  已冻结为 `tests/fixed_point/test_w5_combo_probe_regression.py` 的
+  dispatch contract regression（dispatch 级守护，对应表的"是否
+  接受 / 是否拒绝"列）。SQNR 列保留作历史参考）:
 
-  | input bw | weight bw | output bw | N | cos | SQNR (dB) | 备注 |
+  | input bw | weight bw | output bw | N | cos | SQNR (dB) | 契约 |
   |---|---|---|---|---|---|---|
-  | 8 | 8 | 8 | 64 | 0.99995 | 39.6 | baseline |
-  | **16** | 8 | 8 | 64 | 0.99996 | 41.0 | ✅ 安全 |
-  | 8 | **16** | 8 | 64 | 0.99997 | 42.4 | ✅ 安全 |
-  | 16 | **16** | 8 | 64 | 0.99964 | 31.4 | ⚠️ 边缘 |
-  | 16 | 16 | 16 | **4** | 1.0 | 86.7 | ✅ 小 N |
-  | 16 | 16 | 16 | 64 | 0.99966 | 31.3 | ⚠️ |
-  | 16 | 16 | 16 | **1024** | 0.96 | **9.4** | ❌ |
-  | 16 | 16 | 16 | **4096** | 0.89 | **4.7** | ❌❌ |
+  | 8 | 8 | 8 | 64 | 0.99995 | 39.6 | ✅ accept (baseline) |
+  | **16** | 8 | 8 | 64 | 0.99996 | 41.0 | ✅ accept (SYS-FU-1.B) |
+  | 8 | **16** | 8 | 64 | 0.99997 | 42.4 | ✅ accept (SYS-FU-1.B) |
+  | 16 | **16** | 8 | 64 | 0.99964 | 31.4 | ❌ **reject** (combo > 24) |
+  | 16 | 16 | 16 | **4** | 1.0 | 86.7 | ❌ reject (small N 也拒，contract 不依赖 N) |
+  | 16 | 16 | 16 | 64 | 0.99966 | 31.3 | ❌ reject |
+  | 16 | 16 | 16 | **1024** | 0.96 | **9.4** | ❌ reject |
+  | 16 | 16 | 16 | **4096** | 0.89 | **4.7** | ❌ reject |
 
-  → "2k LSB drift" 在 N≥1024 的 16bit×16bit 上重现；同等 N 下
-  **`16bit input + 8bit weight` 完全安全**，提供一条狭义解封路径。
-- **解封路径选项（SYS-FU-1，未启动）**:
-  - **A. 严格 16bit×16bit**：升 ALU 到 INT64（HW spec 改动），把
-    `SUPPORTED_ACTIVATION_BITWIDTHS` 扩到 `(8, 16)`；架构级 3-5 天，
-    需联合 HW 团队确认契约
-  - **B. 16bit input + 8bit weight 子集**（推荐先做）：放开 input 16bit
-    但强制 weight 仍 8bit。probe 显示该组合在 N≤4096 全程
-    `cos≥0.99996`、`SQNR≥41 dB`，**最低风险路径**。需新增 weight-bw
-    校验测试 + 文档化"INT16 activation 模式不允许 16bit weight"约束。
-    估计 1-2 天
+  → SYS-FU-1.B 解封了 `16+8 / 8+16` 子集（最低风险路径），16+16 reduction
+  仍按 contract 拒（无论 N，避免大 N 隐式退化）。
+- **历史选项（已选定）**:
+  - ~~A. 严格 16bit×16bit~~：升 ALU 到 INT64，**未实施**（HW spec
+    改动，5+ 天）。RESOLVED 后该路径变为"未来可选"。
+  - **B. 16bit input + 8bit weight 子集（已实施）**：扩
+    `SUPPORTED_ACTIVATION_BITWIDTHS = (8, 16)` + 新增
+    `REQUANTIZING_COMBO_BITWIDTH_BUDGET = 24` + `is_reduction` flag。
+    实施落点：commit `c4c15cb` (PR-1 capabilities API) →
+    `8da69c1` (PR-2 adapter/diagnose 接入) →
+    `fc6ebca` (PR-3 守护测试改造) →
+    `177a87e` (PR-4 dispatch 矩阵冻结)。
 - **诊断指引（碰到 16bit acceptance config 报错时）**:
   - 若 acceptance config（如 `mrnn_acceptance_mixed_precision.json`）
-    把某 op 的 `input_bitwidth=16` 升到 16bit 而 `assert_activation_
-    bitwidth_supported` 报错，先确认该 op 的 weight 是否仍 8bit；
-    如是，对应 SYS-FU-1.B 子集，等解封即可；如否，触发本限制
-  - **不要直接把 capabilities 改 `(8, 16)` 然后跑 acceptance** ——
-    会破坏守护测试 `test_int16_fixed_eval_refuses_unsupported_
-    activation_bitwidth`，且 16bit×16bit + 大 N 会产生隐式精度退化
+    把某 op 的 `input_bitwidth=16` 升到 16bit 而组合 gate 报错，
+    先看错误消息是哪一类：
+    - `INT16_FIXED_EVAL bitwidth=N at ... is not validated for
+      REQUANTIZING kernels; supported bitwidths: {8, 16}` —— operand
+      位宽不在 (8, 16)，例如 4-bit weight；改回 8 或 16
+    - `INT16_FIXED_EVAL combo (operand_bw=16, operand_bw=16) at ...
+      exceeds the REQUANTIZING-with-MAC-reduction budget` —— 16+16
+      MAC reduction，把 weight 或 input 一边降到 8-bit
+  - **不要直接把 budget 改 32 或 `_REQUANTIZING_COMBO_VALIDATED_BITWIDTHS`
+    收紧** —— 前者会让 INT32 ALU 在大 N 隐式饱和（W5.1 已数值证伪），
+    后者会破坏 PR-3 的 expected-pass 守护测试。两条都有 commit 历史
+    引用，回滚或调整需先 update 矩阵 + 重跑 probe
+- **acceptance config（`examples/config/mrnn_acceptance_mixed_precision.json`）E2E 状态**:
+  - **dispatch-level（已通过）**: 该 config 把
+    `trans.*` / `power_compress_*` / `hypot_fun.*` / `pre_bn.*` /
+    `fft2band.*` 的 input + output 都升到 16-bit，对应的算子全部
+    是 element-wise REQUANTIZING（如 `Multiply` / `Hypot`）或
+    `BatchNorm`（element-wise 缩放）—— 在 PR-2 的 combo gate 下
+    `is_reduction=False`，无 24-bit budget 约束，16+16 直接通过。
+    具体由 `test_avgpool2d_full_16bit_dispatch_succeeds` /
+    `test_mean_full_16bit_dispatch_succeeds` /
+    `test_linear_asymmetric_16bit_dispatch_succeeds` /
+    `test_w5_combo_probe_regression.py` 覆盖。
+  - **metric-level（未跑）**: `quick_start_int16_metric.py` 全 epoch
+    metric 跑分被 SYS-OPEN-Q-1（MRNN backbone 8-bit baseline 单步
+    SQNR ≤ 5 dB，与 SYS-LIMIT-1 独立未结案）拖底，跑出来的 cosine /
+    Top-1 仅反映 SYS-OPEN-Q-1 而非本 RESOLVED；待 SYS-OPEN-Q-1 闭合
+    后再跑才能展示 SYS-FU-1.B 的真实增益。该跑分在 follow-up 工单
+    中入库。
 
 ## SYS-OPEN-Q-1（未结案）: MRNN backbone 8bit×8bit Conv/ConvT/Linear 单步 SQNR ≤ 5 dB
 
