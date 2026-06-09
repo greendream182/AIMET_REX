@@ -122,43 +122,59 @@
     收紧** —— 前者会让 INT32 ALU 在大 N 隐式饱和（W5.1 已数值证伪），
     后者会破坏 PR-3 的 expected-pass 守护测试。两条都有 commit 历史
     引用，回滚或调整需先 update 矩阵 + 重跑 probe
-- **acceptance config（`examples/config/mrnn_acceptance_mixed_precision.json`）E2E 状态**（2026-06-09 实跑验证）:
-  - **smoke 跑分**（`--max-eval-batches 4 --max-calib-batches 4`，19s 全程）:
-    - `compute_encodings` 完成 4.6s ✅
-    - `ensure_output_quantizers_for_int16_eval` patched 97 slots ✅
-    - CLZ encoding fix（reciprocal=8 / power_2=6）通过 ✅
-    - `convert_encodings_to_fixed_scale`：164 个 affine quantizer
-      已缓存 `(M, r)` ✅
+- **acceptance config（`examples/config/mrnn_acceptance_mixed_precision.json`）E2E 状态**（2026-06-09 实跑验证 + SYS-OPEN-Q-2 修复）:
+  - **初次 smoke 跑分**（修复前，`--max-eval-batches 4 --max-calib-batches 4`，19s）:
+    - `compute_encodings` / CLZ fix / `convert_encodings_to_fixed_scale`
+      （164 个 affine quantizer 缓存 `(M, r)`）/
+      `ensure_output_quantizers_for_int16_eval` patched 97 slots —— 全部 ✅
     - `diagnose_int16_readiness` 报告 1 项 `unsupported_activation_bitwidth`：
       `[('fft2band.module_matmul', 'QuantizedMatMul', 16)]` —— 与
-      `int16_fixed_eval` 实跑同步报错，contract 自洽。
-    - `int16_fixed_eval` ❌ 被
-      `REQUANTIZING-with-MAC-reduction` 拒：`fft2band.module_matmul`
-      input + weight 都是 16-bit，`is_reduction=True`，组合 32 > 24
-      budget。
-    - `float_native` baseline 96.88% Top-1（4 batch）✅
+      `int16_fixed_eval` 实跑同步报错，gate / diagnose / dispatch 自洽。
+    - `int16_fixed_eval` ❌ 被 `REQUANTIZING-with-MAC-reduction` 拒：
+      `fft2band.module_matmul` 两个 input quantizer 都是 16-bit，
+      `is_reduction=True`，组合 32 > 24 budget。
+  - **SYS-OPEN-Q-2 修复**（commit 后续）：把 acceptance config 的
+    `fft2band.*` `input_bitwidth=16` 改为 `8`，`output_bitwidth=16`
+    保留（让下游沿用 16-bit 精度）。**修复理由**：
+    - `BandConverter` 内的 `torch.matmul(stft_mag, self.to_band_matrix)`
+      中 `to_band_matrix` 是从静态 `.pt` 文件预加载的 buffer
+      （非 `nn.Parameter`），v2 sim 在 `model_preparer` 中把它当作
+      `QuantizedMatMul` 的第二个 input（而非 weight），所以走的是
+      `is_reduction=True` MatMul 的两 input 路径。
+    - `utils_rx.py:825` 显示 layer-name-config 不支持 per-input-index
+      bitwidth override（同一 `input_bitwidth` 应用到所有 input
+      quantizers），所以无法只把 `to_band_matrix` 那一边单独降到
+      8-bit 让另一边的 `stft_mag` 保持 16-bit。
+    - 唯一保留 input 16-bit 的方案是把 `BandConverter` 改为
+      `nn.Linear`-based 让 `to_band_matrix` 走 weight 量化路径
+      （SYS-FU-1.B 子集 `16+8`）；这涉及 model 结构 + ckpt 兼容
+      迁移，**留作 enhancement follow-up**（不在本会话范围）。
+    - 对 STFT magnitude（在 ±4 clamp 范围内）降到 8-bit 的精度损失
+      量级 LSB ≈ 0.031，对 ERB band 转换的下游影响有限。
+  - **修复后 smoke 跑分**（20s，4 batch，`--max-eval-batches 4 --max-calib-batches 4`）：
+    - `diagnose_int16_readiness[unsupported_activation_bitwidth]`：
+      **0 项** ✅（gate 全部满足）
+    - `int16_fixed_eval` 全程跑完，**无崩溃** ✅
+    - Top-1: 0.00% (vs `float_native` 96.88%) / cosine: -0.267 /
+      max_abs: 6.10e+01 / mean_abs: 7.19
+    - **该数字与 doc 中 SYS-OPEN-Q-1 已记录的 MRNN 8-bit baseline
+      表现完全一致**（"全图 `int16_fixed_eval Top-1 = 0.00%`、
+      `cosine vs float_native = -0.27`"，见 SYS-OPEN-Q-1 段落），
+      因此**确认 SYS-FU-1.B 修复未引入新回归**——剩余的精度差距
+      是 SYS-OPEN-Q-1 拖底，不是本 contract 问题。
   - **结论**:
-    - **acceptance config 中除 `fft2band.*` MatMul 之外的所有 16-bit
-      升级（element-wise REQUANTIZING / BatchNorm / sum-only 归约）
-      都按 PR-2 combo gate 通过**，与 PR-3/4 守护测试预期一致。
-    - **`fft2band.module_matmul` 是该 config 唯一被新 contract
-      阻断的 op**。该阻断不是 PR-2 引入的回归——PR-2 之前 16-bit
-      input 被旧 `SUPPORTED_ACTIVATION_BITWIDTHS=(8,)` gate 拒，
-      PR-2 之后被新 combo budget 拒，**结果一致**（拒）但**理由
-      更精确**（点出 MAC 累加器饱和而非笼统的"16-bit 不支持"）。
-    - **acceptance config 并未为新 contract 适配**：要让 fft2band
-      的 MatMul 在 `INT16_FIXED_EVAL` 真正跑通，需要把
-      `fft2band.*` 的 `input_bitwidth=16` 与 weight 的 16-bit 中
-      至少一边降到 8-bit（即 SYS-FU-1.B 子集）。这属于**后续
-      工单**（acceptance config 维护方决定哪边降；从 W5.1 probe
-      看 `weight=8bit` 损失最小）。
-  - **metric-level（不再 follow-up）**: 由于 acceptance config 还
-    需调整 fft2band 才能跑全图 INT16_FIXED_EVAL，且 SYS-OPEN-Q-1
-    会拖底任何 backbone-level metric 数字，**全 epoch metric 跑分
-    在 fft2band 重配 + SYS-OPEN-Q-1 闭合前都不会有可比较的数据**。
-    这条已从 SYS-LIMIT-1 的 follow-up 列表中独立成为
-    SYS-OPEN-Q-2（MatMul 在 acceptance config 中的 16+8 重配
-    决策），与本 RESOLVED 不再耦合。
+    - SYS-LIMIT-1 RESOLVED 状态稳定：**acceptance config 现在可以
+      端到端 dispatch 通过 INT16_FIXED_EVAL**，所有 SYS-FU-1.B 守护
+      测试 + diagnose readiness + 实跑表现自洽。
+    - **acceptance config 当前的 16-bit 升级路径**：
+      `trans.*` / `power_compress_*` / `hypot_fun.*` / `pre_bn.*`
+      仍 16-bit input + 16-bit output（element-wise REQUANTIZING
+      或 BatchNorm，不受 budget 约束）；`fft2band.*` 降至
+      8-bit input + 16-bit output（SYS-OPEN-Q-2 修复，dispatch
+      限制使然）。
+    - **metric-level 数字**仍受 SYS-OPEN-Q-1 拖底，**不能用作
+      SYS-FU-1.B 增益的衡量**；要拿可比较的数据，需先闭合
+      SYS-OPEN-Q-1。
 
 ## SYS-OPEN-Q-1（未结案）: MRNN backbone 8bit×8bit Conv/ConvT/Linear 单步 SQNR ≤ 5 dB
 

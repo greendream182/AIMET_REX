@@ -191,11 +191,12 @@
       "comment": "pre_bn 仿射前后激活"
     },
     "fft2band.*": {
-      "input_bitwidth": 16,
+      "input_bitwidth": 8,
       "output_bitwidth": 16,
       "input_symmetric": true,
       "output_symmetric": true,
-      "disable_quantization": false
+      "disable_quantization": false,
+      "comment": "input 降至 8bit (SYS-OPEN-Q-2)：fft2band.module_matmul 的 to_band_matrix 是预加载 buffer，v2 sim 把它当作第二个 input quantizer，与 stft_mag input quantizer 共享 layer-name 配置 (utils_rx.py:825)。两个 input 都 16bit ⇒ MAC reduction combo 32 > REQUANTIZING_COMBO_BITWIDTH_BUDGET=24 触发拒绝。降两个 input 至 8bit 让 SYS-FU-1.B 子集恢复 dispatch；output 保留 16bit 减少下游量化损失。如需保留 input 16bit，需把 BandConverter 改为 nn.Linear-based 让 to_band_matrix 走 weight quantizer 路径 (Enhancement 留作后续)。"
     }
   },
   "GRU_config": {
