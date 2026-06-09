@@ -98,7 +98,83 @@ def test_diagnose_report_keys():
         "uninitialized_encoding",
         "uncalibrated_quantgru",
         "missing_fixed_kernel",
+        "unsupported_activation_bitwidth",
+        "blackbox_native_ops",
     }
+
+
+def test_diagnose_flags_unsupported_activation_bitwidth_blocks_readiness():
+    """A 16+16 MAC-reduction Linear violates the W5 SYS-FU-1.B combo gate
+    (combined bitwidth = 32 > ``REQUANTIZING_COMBO_BITWIDTH_BUDGET = 24``).
+    The diagnose pass must surface it as an explicit readiness blocker so
+    callers fix the config before forward, rather than getting a silent
+    INT32-saturation drift at large reduction depth.
+
+    PR-3 (2026-06-09) replaced the legacy "any 16-bit activation" fixture
+    with a full 16+16 reduction. The asymmetric subset (16+8 or 8+16) is
+    now validated by the combo gate and does NOT block readiness — that
+    expected-pass case is covered by
+    ``test_diagnose_accepts_asymmetric_16bit_combo`` below.
+    """
+
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.v2.nn import QuantizedLinear
+    from aimet_torch.v2.quantization.affine import Quantize
+
+    m = QuantizedLinear(4, 4)
+    m.input_quantizers[0] = Quantize((), 16, symmetric=True)
+    m.param_quantizers["weight"] = Quantize((m.out_features, 1), 16, symmetric=True)
+    m.output_quantizers[0] = Quantize((), 16, symmetric=True)
+    m.input_quantizers[0].min = nn.Parameter(torch.tensor(-2.0))
+    m.input_quantizers[0].max = nn.Parameter(torch.tensor(2.0))
+    m.param_quantizers["weight"].min = nn.Parameter(torch.full((m.out_features, 1), -0.5))
+    m.param_quantizers["weight"].max = nn.Parameter(torch.full((m.out_features, 1), 0.5))
+    m.output_quantizers[0].min = nn.Parameter(torch.tensor(-2.0))
+    m.output_quantizers[0].max = nn.Parameter(torch.tensor(2.0))
+
+    sim = SimpleNamespace(model=nn.Sequential(m))
+    report = diagnose_int16_readiness(sim)
+
+    assert report["unsupported_activation_bitwidth"], (
+        "16+16 MAC-reduction must surface in the readiness report"
+    )
+    label, cls_name, bw = report["unsupported_activation_bitwidth"][0]
+    assert cls_name == "QuantizedLinear"
+    assert bw == 16
+    assert not is_int16_ready(sim)
+
+
+def test_diagnose_accepts_asymmetric_16bit_combo():
+    """16+8 / 8+16 combos validated by W5.1 must NOT block readiness.
+
+    Guards against a regression of the combo gate's lower bound: if
+    someone tightens ``_REQUANTIZING_COMBO_VALIDATED_BITWIDTHS`` back to
+    ``(8,)`` or shrinks ``REQUANTIZING_COMBO_BITWIDTH_BUDGET`` below 24,
+    this test fails fast.
+    """
+
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.v2.nn import QuantizedLinear
+    from aimet_torch.v2.quantization.affine import Quantize
+
+    m = QuantizedLinear(4, 4)
+    m.input_quantizers[0] = Quantize((), 16, symmetric=True)
+    m.param_quantizers["weight"] = Quantize((m.out_features, 1), 8, symmetric=True)
+    m.output_quantizers[0] = Quantize((), 8, symmetric=True)
+    m.input_quantizers[0].min = nn.Parameter(torch.tensor(-2.0))
+    m.input_quantizers[0].max = nn.Parameter(torch.tensor(2.0))
+    m.param_quantizers["weight"].min = nn.Parameter(torch.full((m.out_features, 1), -0.5))
+    m.param_quantizers["weight"].max = nn.Parameter(torch.full((m.out_features, 1), 0.5))
+    m.output_quantizers[0].min = nn.Parameter(torch.tensor(-2.0))
+    m.output_quantizers[0].max = nn.Parameter(torch.tensor(2.0))
+
+    sim = SimpleNamespace(model=nn.Sequential(m))
+    report = diagnose_int16_readiness(sim)
+
+    assert report["unsupported_activation_bitwidth"] == [], (
+        "16+8 (asymmetric, combined=24) must NOT block readiness "
+        f"under the W5 SYS-FU-1.B combo gate; got {report['unsupported_activation_bitwidth']!r}"
+    )
 
 
 @requires_quant_gru_cuda
