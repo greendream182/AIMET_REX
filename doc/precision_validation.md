@@ -122,23 +122,43 @@
     收紧** —— 前者会让 INT32 ALU 在大 N 隐式饱和（W5.1 已数值证伪），
     后者会破坏 PR-3 的 expected-pass 守护测试。两条都有 commit 历史
     引用，回滚或调整需先 update 矩阵 + 重跑 probe
-- **acceptance config（`examples/config/mrnn_acceptance_mixed_precision.json`）E2E 状态**:
-  - **dispatch-level（已通过）**: 该 config 把
-    `trans.*` / `power_compress_*` / `hypot_fun.*` / `pre_bn.*` /
-    `fft2band.*` 的 input + output 都升到 16-bit，对应的算子全部
-    是 element-wise REQUANTIZING（如 `Multiply` / `Hypot`）或
-    `BatchNorm`（element-wise 缩放）—— 在 PR-2 的 combo gate 下
-    `is_reduction=False`，无 24-bit budget 约束，16+16 直接通过。
-    具体由 `test_avgpool2d_full_16bit_dispatch_succeeds` /
-    `test_mean_full_16bit_dispatch_succeeds` /
-    `test_linear_asymmetric_16bit_dispatch_succeeds` /
-    `test_w5_combo_probe_regression.py` 覆盖。
-  - **metric-level（未跑）**: `quick_start_int16_metric.py` 全 epoch
-    metric 跑分被 SYS-OPEN-Q-1（MRNN backbone 8-bit baseline 单步
-    SQNR ≤ 5 dB，与 SYS-LIMIT-1 独立未结案）拖底，跑出来的 cosine /
-    Top-1 仅反映 SYS-OPEN-Q-1 而非本 RESOLVED；待 SYS-OPEN-Q-1 闭合
-    后再跑才能展示 SYS-FU-1.B 的真实增益。该跑分在 follow-up 工单
-    中入库。
+- **acceptance config（`examples/config/mrnn_acceptance_mixed_precision.json`）E2E 状态**（2026-06-09 实跑验证）:
+  - **smoke 跑分**（`--max-eval-batches 4 --max-calib-batches 4`，19s 全程）:
+    - `compute_encodings` 完成 4.6s ✅
+    - `ensure_output_quantizers_for_int16_eval` patched 97 slots ✅
+    - CLZ encoding fix（reciprocal=8 / power_2=6）通过 ✅
+    - `convert_encodings_to_fixed_scale`：164 个 affine quantizer
+      已缓存 `(M, r)` ✅
+    - `diagnose_int16_readiness` 报告 1 项 `unsupported_activation_bitwidth`：
+      `[('fft2band.module_matmul', 'QuantizedMatMul', 16)]` —— 与
+      `int16_fixed_eval` 实跑同步报错，contract 自洽。
+    - `int16_fixed_eval` ❌ 被
+      `REQUANTIZING-with-MAC-reduction` 拒：`fft2band.module_matmul`
+      input + weight 都是 16-bit，`is_reduction=True`，组合 32 > 24
+      budget。
+    - `float_native` baseline 96.88% Top-1（4 batch）✅
+  - **结论**:
+    - **acceptance config 中除 `fft2band.*` MatMul 之外的所有 16-bit
+      升级（element-wise REQUANTIZING / BatchNorm / sum-only 归约）
+      都按 PR-2 combo gate 通过**，与 PR-3/4 守护测试预期一致。
+    - **`fft2band.module_matmul` 是该 config 唯一被新 contract
+      阻断的 op**。该阻断不是 PR-2 引入的回归——PR-2 之前 16-bit
+      input 被旧 `SUPPORTED_ACTIVATION_BITWIDTHS=(8,)` gate 拒，
+      PR-2 之后被新 combo budget 拒，**结果一致**（拒）但**理由
+      更精确**（点出 MAC 累加器饱和而非笼统的"16-bit 不支持"）。
+    - **acceptance config 并未为新 contract 适配**：要让 fft2band
+      的 MatMul 在 `INT16_FIXED_EVAL` 真正跑通，需要把
+      `fft2band.*` 的 `input_bitwidth=16` 与 weight 的 16-bit 中
+      至少一边降到 8-bit（即 SYS-FU-1.B 子集）。这属于**后续
+      工单**（acceptance config 维护方决定哪边降；从 W5.1 probe
+      看 `weight=8bit` 损失最小）。
+  - **metric-level（不再 follow-up）**: 由于 acceptance config 还
+    需调整 fft2band 才能跑全图 INT16_FIXED_EVAL，且 SYS-OPEN-Q-1
+    会拖底任何 backbone-level metric 数字，**全 epoch metric 跑分
+    在 fft2band 重配 + SYS-OPEN-Q-1 闭合前都不会有可比较的数据**。
+    这条已从 SYS-LIMIT-1 的 follow-up 列表中独立成为
+    SYS-OPEN-Q-2（MatMul 在 acceptance config 中的 16+8 重配
+    决策），与本 RESOLVED 不再耦合。
 
 ## SYS-OPEN-Q-1（未结案）: MRNN backbone 8bit×8bit Conv/ConvT/Linear 单步 SQNR ≤ 5 dB
 
