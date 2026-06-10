@@ -314,6 +314,72 @@
   `freq_downs.2.conv2d` cos 0.918、`neck_seqs.1.conv_t` cos 0.911
   与 W6 sweep 数字精确一致。
 
+## SYS-FU-2 工单（2026-06-10）：SYS-OPEN-Q-1 Part B 闭合计划
+
+**背景**：W6 已把 SYS-OPEN-Q-1 拆为 part A（calib outlier，已缓解 3 层）
++ part B（5 层 calib 不敏感）。Part B 阻塞 MRNN 全定点精度验收
+（Top-1 0% vs fp32 96.88%）。本工单跟踪 part B 诊断 → 实验 → 验收。
+
+**工具**：`examples/sys_fu2_activation_dump.py`（path-1 dump 脚本）
+
+### SYS-FU-2-W7 path-1 结果（activation dump，2026-06-10）
+
+- **方法**：fp32 prepared MRNN + SpeechCommands calib **16 batches**，
+  hook W6 part A/B 节点 input（Conv/ConvT pre-hook）+ CLN output；
+  每 channel 池化 abs-percentile；指标 `DR_med = median(p99.99/p50)`、
+  `low% = fraction(channels where p50 < 1%·p99.99)`（multi-mode 代理）。
+
+| module | W6 grp | C | \|x\|max | p50_med | p99_med | p99.99_med | DR_med | low% |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `conv_in` | - | 1 | 2.00 | 0.564 | 2.00 | 2.00 | 3.5 | 0.0% |
+| `freq_downs.0.conv2d` | **B** | 120 | 2.00 | **0.000** | 0.065 | 0.288 | 517k | **77.5%** |
+| `freq_downs.1.conv2d` | **B** | 120 | 2.00 | **0.000** | 1.876 | 2.00 | 2e8 | **98.3%** |
+| `freq_downs.2.conv2d` | **A** | 240 | 2.00 | **0.000** | 2.00 | 2.00 | 2e8 | **98.8%** |
+| `enc_seqs.0.conv_t` | **B** | 120 | 1.00 | 0.855 | 1.00 | 1.00 | 1.2 | 0.0% |
+| `enc_seqs.1.conv_t` | **B** | 240 | 1.00 | 0.919 | 1.00 | 1.00 | 1.1 | 0.0% |
+| `neck_seqs.0.conv_t` | **B** | 320 | 1.00 | 0.898 | 1.00 | 1.00 | 1.1 | 0.0% |
+| `neck_seqs.1.conv_t` | **A** | 320 | 1.00 | 0.674 | 1.00 | 1.00 | 1.5 | 0.0% |
+
+（原始 JSON：`/tmp/sysfu2_act.json`；复现：
+`python examples/sys_fu2_activation_dump.py --max-calib-batches 16`）
+
+- **关键 finding #1 — freq_downs Conv2d 输入是 per-tensor 8bit 的「杀手」**：
+  - 三层 `freq_downs.*.conv2d` 输入 **median p50 ≈ 0**，但 p99 / p99.99
+    可达 0.29–2.0（clamp 顶格）；**77–99% channel 的 p50 不到 p99.99 的
+    1%**（`low%` 列）。
+  - 这是典型 **multi-mode / sparse-spectrum**：多数 channel 长期近零，
+    少数 channel 偶发大值；per-tensor 单一 scale 必然在「保 outlier」与
+    「保多数低幅 channel 分辨率」之间二选一 —— 与 W5.2 random-data
+    SQNR 35 dB vs MRNN 实测 1–5 dB 的 30 dB 差一致。
+  - **part A vs part B 在分布上无清晰分界**：`freq_downs.2`（W6 part A，
+    calib 可缓解）与 `freq_downs.0/1`（part B）同样极端 sparse；
+    W6 part A 的 calib 收益更可能来自 **outlier scale 微调** 而非
+    分布形态差异。
+- **关键 finding #2 — ConvT 输入分布健康，低 SQNR 更像 upstream 误差**：
+  - `enc_seqs.*/neck_seqs.*.conv_t` 的 p50_med 0.67–0.92、`low%=0`、
+    DR_med≈1.1–1.5 —— **不像** local per-tensor grid 分辨率问题。
+  - 但这些层 isolated SQNR 仍 ≤5 dB（W6 表）→ 更可能是 **freq_downs
+    量化误差经 GRU/CLN 传播** 的累积效应，而非 ConvT 自身 activation
+    分布不友好。
+- **关键 finding #3 — `conv_in` 正常**：
+  - p50_med=0.56、DR_med=3.5、low%=0 → 问题在 **conv_in 之后 /
+    freq_downs 之前** 被放大（FrequencyDownSampling + clamp 路径）。
+
+### SYS-FU-2 剩余任务（按优先级）
+
+| ID | 任务 | 目的 | 估时 | 验收 |
+|---|---|---|---|---|
+| **FU-2-1** | path-2：`freq_downs.{0,1,2}.conv2d` input 切 **per-channel activation**（audit 实验，可不进 production spec） | 若 isolated SQNR 从 1–5 dB 拉到 ≥20 dB → 实锤 per-tensor grid 真因 | 0.5–1 d | 3 层 conv2d isolated SQNR |
+| **FU-2-2** | frontend ablation：仅 quant `conv_in` vs `conv_in+freq_downs.0` vs 全 backbone，定位误差放大起点 | 验证 finding #3 | 0.5 d | ablation 表写 doc |
+| **FU-2-3** | ConvT upstream 隔离：`--disable-activation-quantizers` 范围缩到 `freq_downs.*` 之前，测 conv_t isolated SQNR | 验证 finding #2（upstream vs local） | 0.5 d | conv_t SQNR 变化 ≥10 dB 则 upstream |
+| **FU-2-4** | 若 FU-2-1 证实：评估 **per-channel activation** 或 **log-domain / power-compress 输出 per-channel scale** 的业务 spec 变更 | 根治路径选型 | 1–2 d | 方案 ADR |
+| **FU-2-5** | 全图 E2E regression：`verify_int16_qat_sim` Top-1 ≥ min_top1（90%） | MRNN 全定点验收闭合 | 依赖 1–4 | CI / doc 实跑表 |
+
+**不在本工单范围**（已有 owner）：
+- SYS-LIMIT-2 / CLN EPS（R1 重训）
+- fft2band nn.Linear 重构（SYS-OPEN-Q-2 enhancement）
+- part A percentile 默认值（已闭合 commit `309e983`）
+
 ## SYS-LIMIT-2: R2 grid-aware floor 与 fp32 EPS 语义差
 
 详见 `nn.Hardtanh / custom.Clamp / custom.Clip` 章节
