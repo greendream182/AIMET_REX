@@ -17,6 +17,25 @@
 - **不是** test 列表：完整 test 在 `tests/fixed_point/`；本文件指向**主**
   精度测试文件，不重复罗列结构性 / dispatch 测试。
 
+## MRNN 定点验收边界：STFT 不在 AIMET 定点 scope 内
+
+- **产品约定**：MRNN 的 **STFT（`trans`）** 由**板端独立硬化模块**实现，
+  **不做** AIMET `INT16_FIXED_EVAL` 定点化，也不纳入本文件的算子精度
+  验收清单。
+- **仿真对齐**：`examples/quick_start_int16_metric.py` 默认
+  ``--native-trans``（``module_classes_to_exclude=[STFT]`` +
+  ``force_native_trans_float`` 关闭 trans quantizer）；STFT 输出以 fp32
+  谱特征接入后续 `power_compress_1` → … → backbone 定点链。
+- **仍在本 scope 内的前端**：`power_compress_*` / `hypot_fun.*` /
+  `pre_bn.*` / `fft2band.*` 等 STFT **之后**的节点仍走 decomposed
+  INT16 kernel + 混合精度 config。
+- **软件 decomposed STFT**（Pad + QuantizedConv1d）仅作**对照实验**路径
+  （``--no-native-trans``），**不是** MRNN 产品验收口径；勿与板端硬化
+  STFT 混谈 Pass/Fail。
+- **对 SYS-OPEN-Q-1 / SYS-FU-2 的含义**：backbone 精度问题诊断从
+  ``power_compress_1`` 输入侧起算，**不把 STFT 分解子算子的 INT16
+  kernel 纳入 MRNN 真因排查**。
+
 ## 字段说明（每个算子段使用）
 
 | 字段 | 含义 |
@@ -365,11 +384,40 @@
   - p50_med=0.56、DR_med=3.5、low%=0 → 问题在 **conv_in 之后 /
     freq_downs 之前** 被放大（FrequencyDownSampling + clamp 路径）。
 
+### SYS-FU-2-W8 FU-2-1 结果（per-channel activation audit，2026-06-10）
+
+- **工具**：`examples/sys_fu2_per_channel_audit.py`（teacher-forced 单 batch，
+  `quick_start_full_quant.json`，`native_trans` 默认，`percentile=99.5`）
+- **协议**：
+  - **outPT**：上游 INT16 per-tensor carrier 输入 → `INT16_FIXED_EVAL` Conv2d
+  - **outPCfp**：oracle per-channel 8-bit 输入 dequant → **fp32** Conv2d
+    （上界；当前 Conv INT16 kernel **不支持** per-channel input scale MAC）
+  - **inPC_ch**：oracle per-channel 输入 recon 的 per-channel median SQNR
+
+| module | outPT cos | outPT SQNR (dB) | outPCfp SQNR (dB) | inPC_ch med (dB) |
+|---|---:|---:|---:|---:|
+| `freq_downs.0.conv2d` | 0.891 | 4.34 | **53.41** | 34.91 |
+| `freq_downs.1.conv2d` | 0.851 | 1.69 | **52.31** | 36.65 |
+| `freq_downs.2.conv2d` | 0.921 | 4.88 | **inf** | 51.82 |
+
+（复现：`python examples/sys_fu2_per_channel_audit.py --max-calib-batches 16`）
+
+- **结论（FU-2-1 闭合）**：
+  - **per-tensor input grid 是真因，Conv kernel 数学不是**：同一 fp32 输入下，
+    若改用 oracle per-channel dequant 输入，**fp32 conv 输出 SQNR 52–53 dB**
+    vs INT16 per-tensor **1.7–4.9 dB**（与 W5.2 / W6 一致）。
+  - **工程缺口**：`Conv2dInt16Kernel` 的 MAC/requantize 契约当前只支持
+    per-tensor input scale；直接喂 per-channel `FixedPointSimTensor` 会在
+    `requantize_int` 处 shape 冲突 —— **FU-2-4 需 spec + kernel 扩展**。
+  - **inPT_ch median 为 nan 的原因**：per-tensor grid 在「有能量的 channel」
+    上 recon 误差≈0（大值 dominate 全局 cos），但 **77–99% 近零 channel 的
+    分辨率被牺牲**；W7 `low%` + 本表 outPCfp 上界一起构成完整证据链。
+
 ### SYS-FU-2 剩余任务（按优先级）
 
 | ID | 任务 | 目的 | 估时 | 验收 |
 |---|---|---|---|---|
-| **FU-2-1** | path-2：`freq_downs.{0,1,2}.conv2d` input 切 **per-channel activation**（audit 实验，可不进 production spec） | 若 isolated SQNR 从 1–5 dB 拉到 ≥20 dB → 实锤 per-tensor grid 真因 | 0.5–1 d | 3 层 conv2d isolated SQNR |
+| ~~**FU-2-1**~~ | ~~per-channel activation audit~~ | **✅ 2026-06-10 闭合**（见 W8 表） | — | — |
 | **FU-2-2** | frontend ablation：仅 quant `conv_in` vs `conv_in+freq_downs.0` vs 全 backbone，定位误差放大起点 | 验证 finding #3 | 0.5 d | ablation 表写 doc |
 | **FU-2-3** | ConvT upstream 隔离：`--disable-activation-quantizers` 范围缩到 `freq_downs.*` 之前，测 conv_t isolated SQNR | 验证 finding #2（upstream vs local） | 0.5 d | conv_t SQNR 变化 ≥10 dB 则 upstream |
 | **FU-2-4** | 若 FU-2-1 证实：评估 **per-channel activation** 或 **log-domain / power-compress 输出 per-channel scale** 的业务 spec 变更 | 根治路径选型 | 1–2 d | 方案 ADR |
