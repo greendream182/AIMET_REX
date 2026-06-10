@@ -6,13 +6,17 @@
 fp32/fp16/fixed_scale QDQ（会得到 0% 等无效结果）。QDQ 三档请用
 ``int16_whole_graph_vs_float_native.py``。
 
+**STFT 边界（默认）**：``trans``（STFT）走**板端独立硬化模块**，不参与
+AIMET INT16_FIXED_EVAL 定点化；默认 ``--native-trans`` 保留 fp32 黑盒 leaf
+（``module_classes_to_exclude=[STFT]`` + 关闭 trans quantizer）。仅软件
+decomposed STFT 对照实验需显式 ``--no-native-trans``。
+
 用法（在 ``examples/`` 目录下）::
 
     cd /path/to/aimet_rx-main/examples
     python quick_start_int16_metric.py \\
         --data-root /home/llq/workspace/data/speech_commands \\
-        --bitwidth-config config/pc1_hypot_16bit.json \\
-        --native-trans
+        --bitwidth-config config/mrnn_acceptance_mixed_precision.json
 
 默认：**不**全图 Po2；校准 → CLZ encoding fix → ``convert_encodings_to_fixed_scale``。
 可选 ``--apply-po2`` 恢复全图 float scale 圆整（CLZ post-calib 在 Po2 之后应用）。
@@ -750,7 +754,7 @@ def build_sim(
     bitwidth_config: Path | str = ACCEPTANCE_BITWIDTH_CONFIG,
     quant_scheme: str = QUANT_SCHEME,
     percentile_value: float = PERCENTILE_VALUE,
-    native_trans: bool = False,
+    native_trans: bool = True,
     disable_decomposed_functional: bool = False,
     disable_all: bool = False,
     disable_activation: bool = False,
@@ -973,10 +977,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--native-trans",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "STFT(trans) 作为硬件/原生 leaf 保留（module_classes_to_exclude），"
-            "不拆成 QuantizedConv1d/Pad；用于隔离 power_compress_1/hypot_fun 时排除 STFT 8bit QDQ。"
+            "STFT(trans) 作为板端独立硬化模块保留 fp32 黑盒（默认开："
+            "module_classes_to_exclude=[STFT]，关闭 trans quantizer，不参与 "
+            "INT16_FIXED_EVAL 定点化）。仅 decomposed STFT 软件对照实验时用 "
+            "--no-native-trans。"
         ),
     )
     parser.add_argument(

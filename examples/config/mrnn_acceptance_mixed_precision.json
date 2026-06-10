@@ -149,14 +149,14 @@
     }
   },
   "layer_name_config": {
-    "_comment": "诊断定位：trans / power_compress_1 为 PTQ 主损区；16bit activation 保留完整 QDQ 路径",
+    "_comment": "诊断定位：power_compress_1 等为 PTQ 主损区；16bit activation 保留完整 QDQ 路径。trans.* 仅 --no-native-trans（decomposed STFT 软件路径）时生效；默认 --native-trans 下 STFT 为板端硬化黑盒，不参与定点化，本段不生效",
     "trans.*": {
       "input_bitwidth": 16,
       "output_bitwidth": 16,
       "input_symmetric": true,
       "output_symmetric": true,
       "disable_quantization": false,
-      "comment": "STFT 前端，动态范围大"
+      "comment": "仅 decomposed STFT 软件对照；验收默认 native-trans 硬件黑盒，跳过"
     },
     "power_compress_1.*": {
       "input_bitwidth": 16,
