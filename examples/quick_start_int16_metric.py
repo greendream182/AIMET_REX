@@ -18,8 +18,8 @@ decomposed STFT 对照实验需显式 ``--no-native-trans``。
         --data-root /home/llq/workspace/data/speech_commands \\
         --bitwidth-config config/mrnn_acceptance_mixed_precision.json
 
-默认：**不**全图 Po2；校准 → CLZ encoding fix → ``convert_encodings_to_fixed_scale``。
-可选 ``--apply-po2`` 恢复全图 float scale 圆整（CLZ post-calib 在 Po2 之后应用）。
+默认：**不**全图 Po2；校准 → 可选 ``--apply-m-po2``（M/2^n 写回 + re-calib）→ CLZ encoding fix → ``convert_encodings_to_fixed_scale``。
+可选 ``--apply-po2`` 为 legacy 1/2^n 全图圆整。
 INT16 QAT 用 ``--qat-epochs``。
 """
 
@@ -65,6 +65,7 @@ from aimet_torch.fixed_point.qat_train import (  # noqa: E402
     suggest_int16_qat_batch_size,
     warm_int16_qat_lut_cache,
 )
+from aimet_torch.m_po2_quantization import apply_m_po2_recalib_workflow  # noqa: E402
 from aimet_torch.fixed_point.metrics import int16_eval_allow_debug_float  # noqa: E402
 from aimet_torch.utils_rx import apply_mixed_precision_bitwidth, apply_power_of_2_workflow  # noqa: E402
 from aimet_torch.v2 import quantsim  # noqa: E402
@@ -200,6 +201,46 @@ def evaluate_limited(
     if total == 0:
         raise RuntimeError("evaluate_limited: no samples evaluated")
     return correct / total
+
+
+def _encoding_recalib_post_qat(
+    sim,
+    loaders,
+    device: torch.device,
+    *,
+    max_calib_batches: int,
+    sign_input_bypass: bool,
+    sign_input_scale: float | None,
+    power2_fmax: dict | None,
+) -> int:
+    """Re-calibrate encodings on updated QAT weights; refresh CLZ fix + (M,r)."""
+
+    import aimet_torch.v2 as aimet
+    from aimet_torch.m_po2_quantization import clear_sim_fixed_scale_caches
+
+    calib_loader = fresh_calib_loader(loaders["calib"])
+    clear_sim_fixed_scale_caches(sim.model)
+    sim.model.eval()
+    t0 = time.time()
+    with torch.no_grad(), aimet.nn.compute_encodings(sim.model):
+        for idx, (x, _) in enumerate(calib_loader):
+            if idx >= max_calib_batches:
+                break
+            sim.model(x.to(device))
+    if power2_fmax is not None:
+        apply_mrnn_clz_encoding_fixes_post_calib(
+            sim.model,
+            sign_input_scale=None if sign_input_bypass else sign_input_scale,
+            sign_output_unit=not sign_input_bypass,
+            power2_float_out_fmax=power2_fmax,
+            verbose=False,
+        )
+    n_fixed = convert_encodings_to_fixed_scale(sim)
+    print(
+        f"QAT 后 encoding re-calib 完成（calib={max_calib_batches} batch, "
+        f"convert={n_fixed}），耗时 {time.time() - t0:.1f}s"
+    )
+    return n_fixed
 
 
 def _calib_fn(sim_model, loader, device, max_batches: int):
@@ -761,6 +802,7 @@ def build_sim(
     disable_param: bool = False,
     activation_only_scope: str | None = None,
     clz_encoding_fix: bool = True,
+    sign_input_bypass: bool = False,
 ):
     # 验收路径：全图 quantizer 保持开启；前端 STFT/PowerCompress/Hypot 通过
     # mrnn_acceptance_mixed_precision.json 提 activation 至 16bit（设计 §D.2）。
@@ -829,7 +871,9 @@ def build_sim(
             f"[DIAG] native_trans: STFT leaf fp32 黑盒，已关闭 trans 上 {n_cleared} 个 quantizer slot"
         )
     if clz_encoding_fix:
-        apply_mrnn_clz_encoding_fixes(sim.model, sign_input_bypass=False, verbose=False)
+        apply_mrnn_clz_encoding_fixes(
+            sim.model, sign_input_bypass=sign_input_bypass, verbose=False,
+        )
     return sim, (prepared_float if clz_encoding_fix else None)
 
 
@@ -916,13 +960,30 @@ def main() -> None:
     parser.add_argument(
         "--apply-po2",
         action="store_true",
-        help="全图 quantizer float scale 圆整为 2 的幂（旧习惯；默认关闭，Design v2 推荐仅 GRU shift + 其余 (M,r)）",
+        help="legacy：全图 float scale 圆整为 1/2^n（M=1）；与 --apply-m-po2 互斥",
+    )
+    parser.add_argument(
+        "--apply-m-po2",
+        action="store_true",
+        help="硬件 M/2^n grid：snap scale 为 M/2^r（M 可>1）→ re-calib → re-snap；CLZ fix 在其后",
     )
     parser.add_argument(
         "--clz-encoding-fix",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="§2.3 reciprocal/power_2 CLZ encoding fix（默认开；sign 已在 INT16 kernel 修）",
+        help="§2.3 reciprocal/power_2 CLZ encoding fix（默认开）",
+    )
+    parser.add_argument(
+        "--sign-input-bypass",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="module_sign input Q bypass；默认关闭以匹配硬件整数 sign",
+    )
+    parser.add_argument(
+        "--sign-input-scale",
+        type=float,
+        default=2e-9,
+        help="硬件整数 sign 路径的 input Q fine scale；仅 --no-sign-input-bypass 时应用",
     )
     parser.add_argument(
         "--skip-float-native",
@@ -1046,6 +1107,42 @@ def main() -> None:
         type=float,
         default=1e-4,
         help="INT16 QAT 学习率",
+    )
+    parser.add_argument(
+        "--qat-optimizer",
+        choices=("sgd", "adam"),
+        default="adam",
+        help="QAT 优化器（epoch 模式；steps 模式仍用 SGD）",
+    )
+    parser.add_argument(
+        "--qat-lr-scheduler",
+        action="store_true",
+        help="epoch QAT 启用 CosineAnnealingLR",
+    )
+    parser.add_argument(
+        "--qat-val-batches",
+        type=int,
+        default=50,
+        help="QAT val checkpoint batch 数；0=跳过 val；-1=全量 val",
+    )
+    parser.add_argument(
+        "--qat-val-mode",
+        choices=(
+            ExecutionMode.FP32_QDQ.value,
+            ExecutionMode.INT16_FIXED_EVAL.value,
+        ),
+        default=ExecutionMode.INT16_FIXED_EVAL.value,
+        help="QAT val 选模指标（本 sim 上 fp32_qdq val 不可靠，默认 int16_fixed_eval）",
+    )
+    parser.add_argument(
+        "--qat-post-encoding-recalib",
+        action="store_true",
+        help="QAT 后对 calib 重跑 compute_encodings + CLZ post_calib + convert (M,r)",
+    )
+    parser.add_argument(
+        "--no-qat-restore-best",
+        action="store_true",
+        help="QAT 不恢复 val 最优 checkpoint",
     )
     parser.add_argument(
         "--qat-mode",
@@ -1182,6 +1279,9 @@ def main() -> None:
     print(f"设备:       {DEVICE}")
     print(f"数据根目录: {data_root}")
     print(f"Batch size: {args.batch_size}")
+    if args.apply_po2 and args.apply_m_po2:
+        parser.error("--apply-po2 与 --apply-m-po2 互斥")
+
     qat_execution_mode = ExecutionMode(args.qat_mode)
 
     if args.qat_epochs > 0 or args.qat_train_steps > 0:
@@ -1201,10 +1301,12 @@ def main() -> None:
     print(f"Bitwidth cfg: {args.bitwidth_config}")
     print(f"评估 batch: {args.max_eval_batches or '全量 test'}")
     print(f"模式:       {args.modes}")
-    print(
-        "Scale 策略: "
-        + ("全图 apply_power_of_2_workflow" if args.apply_po2 else "默认 (M_int16,rshift)；QuantGRU 内部 2^(-shift)")
-    )
+    scale_note = "默认 (M_int16,rshift)；QuantGRU 内部 2^(-shift)"
+    if args.apply_m_po2:
+        scale_note = "M_Po2 snap + re-calib（M/2^n，M 可>1）"
+    elif args.apply_po2:
+        scale_note = "legacy 全图 apply_power_of_2_workflow（1/2^n）"
+    print(f"Scale 策略: {scale_note}")
     stft_note = "STFT 原生 leaf（硬件路径）" if args.native_trans else "STFT 拆分为 QuantizedConv1d"
     print(f"说明:       {stft_note}；其余 BN/PowerCompress/Hypot/CLN/QuantGRU 仍 decomposed")
     if args.native_trans and args.activation_only_scope == "trans":
@@ -1291,6 +1393,7 @@ def main() -> None:
         disable_param=args.disable_param_quantizers,
         activation_only_scope=args.activation_only_scope,
         clz_encoding_fix=args.clz_encoding_fix,
+        sign_input_bypass=args.sign_input_bypass,
     )
     if args.native_trans:
         trans_cls = type(getattr(sim.model, "trans", None)).__name__
@@ -1318,7 +1421,23 @@ def main() -> None:
             pf, loaders["calib"], DEVICE, args.max_calib_batches,
         )
 
-    if args.apply_po2:
+    if args.apply_m_po2:
+        t_mpo2 = time.time()
+        calib_loader = fresh_calib_loader(loaders["calib"])
+        mpo2_stats = apply_m_po2_recalib_workflow(
+            sim.model,
+            calib_loader,
+            DEVICE,
+            max_calib_batches=args.max_calib_batches,
+            verbose=False,
+        )
+        print(
+            f"M_Po2 + re-calib 完成（pre {mpo2_stats['pre_snap']['modified']}/"
+            f"{mpo2_stats['pre_snap']['total']} → recalib {mpo2_stats['recalib_batches']} batch → "
+            f"post {mpo2_stats['post_snap']['modified']}/{mpo2_stats['post_snap']['total']}），"
+            f"耗时 {time.time() - t_mpo2:.1f}s"
+        )
+    elif args.apply_po2:
         apply_power_of_2_workflow(
             sim.model,
             method="round",
@@ -1328,17 +1447,29 @@ def main() -> None:
         )
         print("apply_power_of_2_workflow 完成（全图 float scale → 2^n）")
     else:
-        print("跳过全图 Po2：QuantGRU 用 internal shift；分解层边界用 (M_int16, rshift)")
+        print("跳过 Po2/M_Po2：QuantGRU 用 internal shift；分解层边界用 (M_int16, rshift)")
 
     if args.clz_encoding_fix and prepared_float is not None and power2_fmax is not None:
         t_clz = time.time()
         clz_stats = apply_mrnn_clz_encoding_fixes_post_calib(
-            sim.model, power2_float_out_fmax=power2_fmax, verbose=False,
+            sim.model,
+            sign_input_scale=None if args.sign_input_bypass else args.sign_input_scale,
+            sign_output_unit=not args.sign_input_bypass,
+            power2_float_out_fmax=power2_fmax,
+            verbose=False,
         )
         sim._clz_encoding_fix_stats = clz_stats  # noqa: SLF001
         rec = clz_stats["reciprocal_denom"]["touched"]
         sq = clz_stats["power2_output"]["touched"]
-        print(f"CLZ encoding fix 完成（reciprocal={rec}, power_2={sq}），耗时 {time.time() - t_clz:.1f}s")
+        sign = clz_stats.get("sign_input", {}).get("touched", 0)
+        sign_out = clz_stats.get("sign_output", {}).get("touched", 0)
+        clamp_pos = clz_stats.get("positive_clamp_output", {}).get("touched", 0)
+        pc2_pos = clz_stats.get("pc2_positive", {}).get("touched", 0)
+        print(
+            f"CLZ encoding fix 完成（sign_input={sign}, sign_output={sign_out}, "
+            f"clamp_pos={clamp_pos}, pc2_positive={pc2_pos}, "
+            f"reciprocal={rec}, power_2={sq}），耗时 {time.time() - t_clz:.1f}s"
+        )
 
     n_fixed = convert_encodings_to_fixed_scale(sim)
     print(f"convert_encodings_to_fixed_scale: {n_fixed} 个 affine quantizer 已缓存 (M,r)")
@@ -1418,13 +1549,54 @@ def main() -> None:
         trainable = select_qat_trainable_parameters(sim.model, scope=scope)
         print(
             f"\n--- {qat_execution_mode.value} 训练 ({args.qat_epochs} epoch(s), "
-            f"scope={scope}, lr={args.qat_lr}, params={len(trainable)}) ---"
+            f"scope={scope}, opt={args.qat_optimizer}, lr={args.qat_lr}, "
+            f"params={len(trainable)}) ---"
         )
         if not trainable:
             print("无可训练参数，跳过 QAT")
         else:
             freeze_quantizer_parameters(sim.model, verbose=False, freeze_bn_affine=True)
             clip = args.qat_grad_clip if args.qat_grad_clip > 0 else None
+            val_fn = None
+            val_loader = None
+            if args.qat_val_batches != 0 and "val" in loaders:
+                val_max = None if args.qat_val_batches < 0 else args.qat_val_batches
+                val_loader = loaders["val"]
+                val_mode = ExecutionMode(args.qat_val_mode)
+
+                def _qat_val_fn(m: torch.nn.Module) -> float:
+                    release_cuda_memory(m)
+                    m.eval()
+                    if val_mode is ExecutionMode.INT16_FIXED_EVAL:
+                        with quant_execution_mode(val_mode):
+                            with int16_eval_allow_debug_float():
+                                return evaluate_limited(
+                                    m,
+                                    val_loader,
+                                    DEVICE,
+                                    max_batches=val_max,
+                                    micro_batch_size=args.eval_micro_batch_size,
+                                    label="qat_val",
+                                    log_every=0,
+                                )
+                    with quant_execution_mode(val_mode):
+                        return evaluate_limited(
+                            m,
+                            val_loader,
+                            DEVICE,
+                            max_batches=val_max,
+                            micro_batch_size=args.eval_micro_batch_size,
+                            label="qat_val",
+                            log_every=0,
+                        )
+
+                val_fn = _qat_val_fn
+                val_batches_label = "全量" if val_max is None else str(val_max)
+                print(
+                    f"  QAT val checkpoint: {val_mode.value}, batches={val_batches_label}, "
+                    f"restore_best={not args.no_qat_restore_best}",
+                    flush=True,
+                )
             try:
                 history = run_int16_qat_epochs(
                     sim.model,
@@ -1433,6 +1605,8 @@ def main() -> None:
                     epochs=args.qat_epochs,
                     lr=args.qat_lr,
                     scope=scope,
+                    optimizer=args.qat_optimizer,  # type: ignore[arg-type]
+                    lr_scheduler=args.qat_lr_scheduler,
                     grad_clip_norm=clip,
                     max_batches_per_epoch=args.qat_batches_per_epoch,
                     batch_size=args.qat_batch_size,
@@ -1442,17 +1616,37 @@ def main() -> None:
                     log_timing=args.qat_log_timing,
                     log_every=args.qat_log_every,
                     check_finite_every=args.qat_check_finite_every,
+                    val_loader=val_loader,
+                    val_fn=val_fn,
+                    restore_best=not args.no_qat_restore_best,
                 )
                 for row in history:
-                    print(
+                    msg = (
                         f"  epoch {int(row['epoch'])}: "
                         f"batches={int(row['batches'])} "
                         f"loss_mean={row['loss_mean']:.4f} "
                         f"loss_last={row['loss_last']:.4f}"
                     )
+                    if "val_top1" in row:
+                        msg += f" val={float(row['val_top1']) * 100:.2f}%"
+                    print(msg)
+                if history and "val_restored" in history[-1]:
+                    print(
+                        f"  val restored: {float(history[-1]['val_restored']) * 100:.2f}%"
+                    )
             except Exception as exc:
                 qat_failed = True
                 print(f"INT16 QAT epoch 训练失败: {exc}")
+        if not qat_failed and args.qat_post_encoding_recalib:
+            _encoding_recalib_post_qat(
+                sim,
+                loaders,
+                DEVICE,
+                max_calib_batches=args.max_calib_batches,
+                sign_input_bypass=args.sign_input_bypass,
+                sign_input_scale=args.sign_input_scale,
+                power2_fmax=power2_fmax,
+            )
         release_cuda_memory(sim.model)
         sim.model.eval()
 
@@ -1529,6 +1723,16 @@ def main() -> None:
                         "可试 --batch-size 32 --qat-batch-size 16 "
                         "或 export PYTORCH_ALLOC_CONF=expandable_segments:True"
                     )
+        if not qat_failed and args.qat_post_encoding_recalib:
+            _encoding_recalib_post_qat(
+                sim,
+                loaders,
+                DEVICE,
+                max_calib_batches=args.max_calib_batches,
+                sign_input_bypass=args.sign_input_bypass,
+                sign_input_scale=args.sign_input_scale,
+                power2_fmax=power2_fmax,
+            )
         release_cuda_memory(sim.model)
         sim.model.eval()
 

@@ -68,9 +68,10 @@ python examples/quick_start_int16_metric.py \
 
 | 用途 | 是否默认 |
 |------|----------|
-| 新项目 INT16 验收（whole_graph / int16_metric / single_op） | **否** — `(M,rshift)` |
-| `quick_start.py` 旧端到端演示 | 是（历史行为） |
-| `--apply-po2` / probe 脚本 | 可选 legacy 对比 |
+| 新项目 INT16 验收（whole_graph / int16_metric / single_op） | **否** — 校准后 ``convert_encodings_to_fixed_scale`` 离线生成 ``M/2^n`` |
+| `quick_start.py` 旧端到端演示 | 是（legacy ``1/2^n`` 全图 Po2） |
+| ``--apply-m-po2``（``quick_start_int16_metric.py``） | 可选：snap 写回 ``M/2^n`` + re-calib（W26 未提升 E2E） |
+| ``--apply-po2`` / probe 脚本 | 可选 legacy 对比（``M=1`` 子集） |
 
 ## `freeze_int16_fixed.py`
 

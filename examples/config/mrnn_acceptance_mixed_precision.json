@@ -1,6 +1,7 @@
 {
   "description": "MRNN 验收混合精度：主体保持 8bit W/A；STFT/PowerCompress/Hypot 前端 activation 提至 16bit （设计 §D.2 提高 bitwidth，非 disable quantizer 替代方案）",
   "comment": "本配置不引用任何模型特定的 layer name，复用到不同 MRNN 变体均可工作。如需对模型中的 EPS 加法 / 标量 size 乘法这类无意义量化点做精细 disable，请在 layer_name_config 中按需追加 wildcard，比如 *.cln.module_add_* / module_floordiv* 等；这些孤儿 quantizer 即使 NOT_INITIALIZED 通常也不阻断 forward，配合 step14 的兜底 compute_encodings 即可",
+  "pattern_priority": true,
   "default_bitwidth": {
     "weight": 8,
     "output": 8
@@ -172,7 +173,7 @@
       "input_symmetric": true,
       "output_symmetric": true,
       "disable_quantization": false,
-      "comment": "第二次 power compress"
+      "comment": "第二次 power compress；Abs 走 M/rshift requant 后支持全 16bit"
     },
     "hypot_fun.*": {
       "input_bitwidth": 16,

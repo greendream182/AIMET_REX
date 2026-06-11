@@ -264,7 +264,11 @@ def _audit_one(
         y_pt = _to_float(module(x_pt))
     assert y_pt is not None
 
-    # Upper bound: fp32 conv on per-channel-dequantized input (kernel not PC-input yet).
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_EVAL):
+        y_pc = _to_float(module(x_pc))
+    assert y_pc is not None
+
+    # Upper bound: fp32 conv on per-channel-dequantized input.
     with quant_execution_mode(ExecutionMode.FP32_QDQ):
         y_pc_fp32 = _to_float(module(x_pc_dq))
     assert y_pc_fp32 is not None
@@ -281,6 +285,8 @@ def _audit_one(
         - _per_channel_median_sqnr(x_float, x_pt_dq),
         "out_pt_cos": _cosine(y_pt, y_ref),
         "out_pt_sqnr": _sqnr_db(y_ref, y_pt),
+        "out_pc_cos": _cosine(y_pc, y_ref),
+        "out_pc_sqnr": _sqnr_db(y_ref, y_pc),
         "out_pc_fp32_cos": _cosine(y_pc_fp32, y_ref),
         "out_pc_fp32_sqnr": _sqnr_db(y_ref, y_pc_fp32),
     }
@@ -368,7 +374,7 @@ def main() -> None:
     )
     header = (
         f"{'module':28s} {'inPT_ch':>7s} {'inPC_ch':>7s} {'Δch_dB':>7s} "
-        f"{'outPT_cos':>8s} {'outPT_dB':>7s} {'outPCfp_dB':>9s}"
+        f"{'outPT_cos':>8s} {'outPT_dB':>7s} {'outPC_dB':>7s} {'outPCfp_dB':>9s}"
     )
     print(header)
     for suffix in _TARGETS:
@@ -389,14 +395,14 @@ def main() -> None:
             f"{stats['in_pc_ch_med_sqnr']:7.2f} "
             f"{stats['in_delta_ch_med_db']:+7.2f} "
             f"{stats['out_pt_cos']:8.4f} {stats['out_pt_sqnr']:7.2f} "
-            f"{stats['out_pc_fp32_sqnr']:9.2f}"
+            f"{stats['out_pc_sqnr']:7.2f} {stats['out_pc_fp32_sqnr']:9.2f}"
         )
     print(
         "\ninPT_ch/inPC_ch = **median per-channel** input recon SQNR (PT = upstream "
         "INT16 carrier grid; PC = oracle per-channel). Global in_cos≈1 hides W7 "
-        "low-magnitude channel collapse. outPT = INT16 conv; outPCfp = fp32 conv "
-        "upper bound if PC input were available. INT16 Conv kernel lacks per-channel "
-        "input scale MAC contract today."
+        "low-magnitude channel collapse. outPT = INT16 conv + per-tensor input; "
+        "outPC = INT16 conv + per-channel input (channel-align pre-MAC); "
+        "outPCfp = fp32 conv upper bound."
     )
 
 

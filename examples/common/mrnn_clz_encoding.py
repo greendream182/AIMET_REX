@@ -1,6 +1,7 @@
 """MRNN 分解图与 §2.3 CLZ 规格化类的 encoding 修复（非 bypass 主路径）。
 
-- sign: bypass input Q（§3.1，非 LUT head）
+- sign: 可选 bypass input Q；硬件整数 sign 路径用专用 fine-scale input Q（仅 pc1）
+- power_compress_2: 幅度链正域 unsigned grid [0,4]/[0,2]
 - module_div 分母 b=std: reciprocal 正域 encoding（unsigned + min≥eps）
 - module_square: power_2 输出 range 重标定 out_min/out_max
 """
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 
 SIGN_NAME_RE = re.compile(r"(^|\.)module_sign(?:_\d+)?$")
+PC1_SIGN_ONLY_RE = re.compile(r"power_compress_1\.module_sign$")
 DIV_NAME_RE = re.compile(r"(^|\.)module_div_\d+$")
 SQUARE_NAME_RE = re.compile(r"(^|\.)module_square(?:_\d+)?$")
 
@@ -275,6 +277,199 @@ def fix_power2_output_encodings(
     return stats
 
 
+def fix_sign_input_encodings(
+    model: nn.Module,
+    *,
+    scale: float = 2e-9,
+    min_bitwidth: int = 16,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """重标定 ``module_sign`` 输入为符号专用 fine scale。
+
+    该输入只供 spec §4.3.6 ``sign(q_x - Z_x)`` 比较器使用，幅值饱和不影响
+    输出符号；目标是避免 STFT 近零非零值被 input Q round 到 0。
+    """
+
+    stats: dict[str, Any] = {"touched": 0, "skipped": [], "scale": scale}
+    if scale <= 0:
+        raise ValueError(f"sign input scale must be positive; got {scale}")
+
+    for name, mod in model.named_modules():
+        if not SIGN_NAME_RE.search(name):
+            continue
+        # pc2 输入为 [0,4] 幅度，不需要 STFT 近零 fine scale（仅 pc1 需要）
+        if not PC1_SIGN_ONLY_RE.search(name):
+            continue
+        iqs = getattr(mod, "input_quantizers", None)
+        if not iqs or iqs[0] is None:
+            stats["skipped"].append((name, "no input quantizer"))
+            continue
+        q = iqs[0]
+        if not _q_initialized(q):
+            stats["skipped"].append((name, "input not initialized"))
+            continue
+
+        bw = max(int(getattr(q, "bitwidth", min_bitwidth)), min_bitwidth)
+        q.bitwidth = bw
+        q.symmetric = True
+        q.qmin = -(2 ** (bw - 1))
+        q.qmax = 2 ** (bw - 1) - 1
+        amax = scale * float(q.qmax)
+        dev, dt = _q_device_dtype(q)
+        q.set_range(
+            torch.tensor(-amax, device=dev, dtype=dt),
+            torch.tensor(amax, device=dev, dtype=dt),
+        )
+        stats["touched"] += 1
+        if verbose:
+            print(
+                f"  sign input: {name}.input[0] bw={bw} scale={scale:.3e} "
+                f"range=[{-amax:.3e}, {amax:.3e}]"
+            )
+    return stats
+
+
+def fix_sign_output_encodings(
+    model: nn.Module,
+    *,
+    bitwidth: int = 8,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """将 ``module_sign`` 输出重标定为 unit grid。
+
+    spec §4.3.6 的硬件输出码值就是 ``{-1, 0, 1}``。因此输出 scale 必须为
+    1.0，后续算子解读该 tensor 时才得到实值 ``{-1, 0, 1}``。
+    """
+
+    stats: dict[str, Any] = {"touched": 0, "skipped": [], "scale": 1.0}
+    if bitwidth < 2:
+        raise ValueError(f"sign output bitwidth must be >= 2; got {bitwidth}")
+
+    qmin = -(2 ** (bitwidth - 1))
+    qmax = 2 ** (bitwidth - 1) - 1
+    for name, mod in model.named_modules():
+        if not SIGN_NAME_RE.search(name):
+            continue
+        oqs = getattr(mod, "output_quantizers", None)
+        if not oqs or oqs[0] is None:
+            stats["skipped"].append((name, "no output quantizer"))
+            continue
+        q = oqs[0]
+        if not _q_initialized(q):
+            stats["skipped"].append((name, "output not initialized"))
+            continue
+
+        q.bitwidth = bitwidth
+        q.symmetric = True
+        q.qmin = qmin
+        q.qmax = qmax
+        dev, dt = _q_device_dtype(q)
+        q.set_range(
+            torch.tensor(float(qmin), device=dev, dtype=dt),
+            torch.tensor(float(qmax), device=dev, dtype=dt),
+        )
+        stats["touched"] += 1
+        if verbose:
+            print(f"  sign output: {name}.output[0] bw={bitwidth} scale=1.0")
+    return stats
+
+
+def _set_unsigned_range(q, lo: float, hi: float) -> None:
+    bw = int(getattr(q, "bitwidth", 16))
+    q.bitwidth = bw
+    q.symmetric = False
+    q.qmin = 0
+    q.qmax = 2**bw - 1
+    dev, dt = _q_device_dtype(q)
+    q.set_range(
+        torch.tensor(lo, device=dev, dtype=dt),
+        torch.tensor(hi, device=dev, dtype=dt),
+    )
+
+
+def fix_positive_clamp_output_encodings(
+    model: nn.Module,
+    *,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """正域 clamp 输出改为 unsigned，避免 pc2 入口仍是对称 grid。"""
+
+    stats: dict[str, Any] = {"touched": 0, "skipped": []}
+    targets = {
+        "module_clamp_2": (0.0, 4.0),
+        "module_clamp_3": (0.0, 4.0),
+        "module_clamp_4": (0.0, 2.0),
+    }
+    mods = dict(model.named_modules())
+    for name, (lo, hi) in targets.items():
+        mod = mods.get(name)
+        if mod is None:
+            stats["skipped"].append((name, "missing module"))
+            continue
+        oqs = getattr(mod, "output_quantizers", None)
+        if not oqs or oqs[0] is None or not _q_initialized(oqs[0]):
+            stats["skipped"].append((name, "output not initialized"))
+            continue
+        _set_unsigned_range(oqs[0], lo, hi)
+        stats["touched"] += 1
+        if verbose:
+            print(f"  clamp output unsigned: {name} [0, {hi}]")
+    return stats
+
+
+def fix_power_compress_2_positive_encodings(
+    model: nn.Module,
+    *,
+    mag_max: float = 4.0,
+    sqrt_max: float = 2.0,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """pc2 输入为 ``module_clamp_3`` 后的非负幅度 ``[0, mag_max]``。
+
+    16-bit 全链需正域 unsigned grid；对称 ``[-mag_max, mag_max]`` 会让
+    ``module_abs_2`` isolated/chained SQNR 崩到 ~0 dB。
+    """
+
+    stats: dict[str, Any] = {"touched": 0, "skipped": []}
+    targets: dict[str, dict[str, tuple[float, float] | None]] = {
+        "power_compress_2.module_sign_1": {"in0": (0.0, mag_max)},
+        "power_compress_2.module_abs_2": {"in0": (0.0, mag_max), "out0": (0.0, mag_max)},
+        "power_compress_2.module_sqrt_2": {
+            "in0": (0.0, mag_max),
+            "out0": (0.0, sqrt_max),
+        },
+        "power_compress_2.module_mul_2": {"out0": (0.0, sqrt_max)},
+    }
+    mods = dict(model.named_modules())
+    for name, slots in targets.items():
+        mod = mods.get(name)
+        if mod is None:
+            stats["skipped"].append((name, "missing module"))
+            continue
+        touched_here = 0
+        if "in0" in slots and slots["in0"] is not None:
+            iqs = getattr(mod, "input_quantizers", None)
+            if not iqs or iqs[0] is None or not _q_initialized(iqs[0]):
+                stats["skipped"].append((name, "input0 not initialized"))
+            else:
+                lo, hi = slots["in0"]
+                _set_unsigned_range(iqs[0], lo, hi)
+                touched_here += 1
+        if "out0" in slots and slots["out0"] is not None:
+            oqs = getattr(mod, "output_quantizers", None)
+            if not oqs or oqs[0] is None or not _q_initialized(oqs[0]):
+                stats["skipped"].append((name, "output0 not initialized"))
+            else:
+                lo, hi = slots["out0"]
+                _set_unsigned_range(oqs[0], lo, hi)
+                touched_here += 1
+        if touched_here:
+            stats["touched"] += touched_here
+            if verbose:
+                print(f"  pc2 positive domain: {name} slots={touched_here}")
+    return stats
+
+
 def apply_mrnn_clz_encoding_fixes(
     model: nn.Module,
     *,
@@ -295,12 +490,30 @@ def apply_mrnn_clz_encoding_fixes_post_calib(
     *,
     reciprocal_denom: bool = True,
     power2_output: bool = True,
+    positive_clamp_output: bool = True,
+    pc2_positive: bool = True,
+    sign_input_scale: float | None = None,
+    sign_output_unit: bool = False,
     power2_float_out_fmax: dict[str, float] | None = None,
     eps: float = 1e-8,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """compute_encodings 之后（可选 legacy Po2 之后）：reciprocal 分母 + power_2 输出。"""
     out: dict[str, Any] = {}
+    if sign_input_scale is not None:
+        out["sign_input"] = fix_sign_input_encodings(
+            model, scale=sign_input_scale, verbose=verbose,
+        )
+    if sign_output_unit:
+        out["sign_output"] = fix_sign_output_encodings(model, verbose=verbose)
+    if positive_clamp_output:
+        out["positive_clamp_output"] = fix_positive_clamp_output_encodings(
+            model, verbose=verbose,
+        )
+    if pc2_positive:
+        out["pc2_positive"] = fix_power_compress_2_positive_encodings(
+            model, verbose=verbose,
+        )
     if reciprocal_denom:
         out["reciprocal_denom"] = fix_reciprocal_denom_encodings(
             model, eps=eps, verbose=verbose,
