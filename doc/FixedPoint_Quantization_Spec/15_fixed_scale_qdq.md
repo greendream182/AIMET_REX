@@ -110,7 +110,7 @@ class FixedScaleEncoding:
 # offline/scale_fixed.py
 def quantize_scale_to_m_rshift(
     scale: Union[float, torch.Tensor],
-    multiplier_bits: int = 15,
+    multiplier_bits: int = 16,
     max_rshift: int = 31,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 

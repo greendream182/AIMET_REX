@@ -40,7 +40,7 @@ freeze_int16_fixed(sim_model, output_path) -> path/to/encodings_int16.json
 
 输出 sidecar JSON 字段（在原 encoding 上扩展）：
 
-- 每层：`multiplier_int16` / `rshift_int8`
+- 每层：`multiplier_uint16` / `rshift_int8`
 - Conv/Linear 层：附 `bias_int32_path`
 - Add/Concat：每路输入对应一组 `m_i` / `s_i`
 - AvgPool：`multiplier` 含 `1/kernel_size` 的近似
@@ -49,8 +49,8 @@ freeze_int16_fixed(sim_model, output_path) -> path/to/encodings_int16.json
 不变式：
 
 - 浮点 scale 进入 pipeline；整数 multiplier / rshift 出 pipeline。
-- PWL 离线拟合（`generate_pwl_lut`）使用 `(m_int16, rshift)` 反演的 **effective scale**（`m/2^r`），与板端 scale 权威一致（ADR-015）。
-- 同一 op 的 multiplier 与 rshift 必须满足 `0 <= multiplier <= 32767`，`0 <= rshift <= 31`。
+- PWL 离线拟合（`generate_pwl_lut`）使用 `(m_uint16, rshift)` 反演的 **effective scale**（`m/2^r`），与板端 scale 权威一致（ADR-015）。
+- 同一 op 的 multiplier 与 rshift 必须满足 `0 <= multiplier <= 65535`，`0 <= rshift <= 31`。
 - 误差超阈值时（`|real_multiplier - multiplier/2^rshift| / real_multiplier > 0.5%`）输出 warning 并写入报告。
 - 二进制 LUT / bias 文件按 little-endian 写入，与 sidecar JSON 路径关联。
 
@@ -60,10 +60,10 @@ freeze_int16_fixed(sim_model, output_path) -> path/to/encodings_int16.json
 # offline/multiplier.py
 def quantize_multiplier(
     real_multiplier: float | torch.Tensor,
-    multiplier_bits: int = 15,
+    multiplier_bits: int = 16,
     max_rshift: int = 31,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """返回 (multiplier_int16, rshift_int8)。"""
+    """返回 (multiplier_uint16, rshift_int8)。"""
     ...
 
 # offline/bias.py
@@ -187,13 +187,13 @@ def test_quantize_multiplier_known_value():
 def test_quantize_multiplier_per_channel():
     real = torch.tensor([0.1, 0.05, 0.01])
     m, s = quantize_multiplier(real)
-    assert m.dtype == torch.int16
+    assert m.dtype == torch.uint16
     assert s.dtype == torch.int8
 
 def test_freeze_pipeline_writes_all_keys():
     sim = build_tiny_calibrated_sim()
     report = freeze_int16_fixed(sim, "out.json")
-    assert "multiplier_int16" in report["conv1"]
+    assert "multiplier_uint16" in report["conv1"]
     assert "bias_int32_path" in report["conv1"]
 ```
 

@@ -36,7 +36,7 @@ Status: implemented
 输入：
 
 - `acc.dtype == torch.int32`
-- `multiplier.dtype == torch.int16`，`0 <= multiplier <= 32767`
+- `multiplier.dtype == torch.uint16`，`0 <= multiplier <= 65535`
 - `rshift.dtype == torch.int8`，`0 <= rshift <= 31`
 - `y_zp.dtype == torch.int32`
 - `qmin`, `qmax`：int
@@ -99,7 +99,7 @@ def round_shift(
 ```text
 def requantize_int(acc, multiplier, rshift, y_zp, qmin, qmax, mode):
     assert acc.dtype == torch.int32
-    assert multiplier.dtype == torch.int16
+    assert multiplier.dtype == torch.uint16
     assert rshift.dtype == torch.int8
 
     prod = acc.to(torch.int64) * multiplier.to(torch.int64)

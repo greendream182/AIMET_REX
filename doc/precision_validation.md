@@ -406,22 +406,527 @@
   - **per-tensor input grid 是真因，Conv kernel 数学不是**：同一 fp32 输入下，
     若改用 oracle per-channel dequant 输入，**fp32 conv 输出 SQNR 52–53 dB**
     vs INT16 per-tensor **1.7–4.9 dB**（与 W5.2 / W6 一致）。
-  - **工程缺口**：`Conv2dInt16Kernel` 的 MAC/requantize 契约当前只支持
-    per-tensor input scale；直接喂 per-channel `FixedPointSimTensor` 会在
-    `requantize_int` 处 shape 冲突 —— **FU-2-4 需 spec + kernel 扩展**。
+  - **工程缺口（FU-2-4 已闭合）**：per-channel 输入经 **channel-align**（``max(S_x)`` 统一 grid）后走标准 Conv MAC；见 W9。
   - **inPT_ch median 为 nan 的原因**：per-tensor grid 在「有能量的 channel」
     上 recon 误差≈0（大值 dominate 全局 cos），但 **77–99% 近零 channel 的
     分辨率被牺牲**；W7 `low%` + 本表 outPCfp 上界一起构成完整证据链。
 
-### SYS-FU-2 剩余任务（按优先级）
+### SYS-FU-2-W9 FU-2-4 结果（per-channel input channel-align，2026-06-10）
 
-| ID | 任务 | 目的 | 估时 | 验收 |
-|---|---|---|---|---|
-| ~~**FU-2-1**~~ | ~~per-channel activation audit~~ | **✅ 2026-06-10 闭合**（见 W8 表） | — | — |
-| **FU-2-2** | frontend ablation：仅 quant `conv_in` vs `conv_in+freq_downs.0` vs 全 backbone，定位误差放大起点 | 验证 finding #3 | 0.5 d | ablation 表写 doc |
-| **FU-2-3** | ConvT upstream 隔离：`--disable-activation-quantizers` 范围缩到 `freq_downs.*` 之前，测 conv_t isolated SQNR | 验证 finding #2（upstream vs local） | 0.5 d | conv_t SQNR 变化 ≥10 dB 则 upstream |
-| **FU-2-4** | 若 FU-2-1 证实：评估 **per-channel activation** 或 **log-domain / power-compress 输出 per-channel scale** 的业务 spec 变更 | 根治路径选型 | 1–2 d | 方案 ADR |
-| **FU-2-5** | 全图 E2E regression：`verify_int16_qat_sim` Top-1 ≥ min_top1（90%） | MRNN 全定点验收闭合 | 依赖 1–4 | CI / doc 实跑表 |
+- **实现**：`aimet_torch/fixed_point/channel_align.py`
+  - per-channel 输入（``axis=1``）在 Conv/Linear MAC 前 **align 到 ``max(S_x[c])`` 统一 grid**
+  - adapter 在 ``dispatch_int16_fixed`` 对 ``Conv1d/Conv2d/Linear`` 自动调用
+- **单测**：`tests/fixed_point/test_channel_align_conv.py`（align 保真 + per-channel 输入不 crash）
+- **验收**：重跑 `examples/sys_fu2_per_channel_audit.py`，关注 **outPC_dB** 列是否接近 outPCfp 上界（52+ dB）
+
+**容器实跑（`quant-gru-cuda128`，2026-06-10；GPU 需 `docker restart quant-gru-cuda128` 若 NVML 失效）**：
+
+| module | outPT_dB | outPC_dB | outPCfp_dB |
+|---|---:|---:|---:|
+| `freq_downs.0.conv2d` | 4.34 | **4.34** | 53.41 |
+| `freq_downs.1.conv2d` | 1.69 | **1.69** | 52.31 |
+| `freq_downs.2.conv2d` | 4.88 | **4.88** | inf |
+
+- **结论（FU-2-4  plumbing ✅，MRNN 精度增益 ❌）**：
+  - channel-align 消除了 per-channel 输入的 shape crash，但 **outPC ≈ outPT**。
+  - 根因：`max(S_pc[c]) == S_pt`（例 fd0：均为 **0.015748**）—— oracle
+    per-channel 的 outlier scale 与生产 per-tensor carrier **相同**；align
+    是 no-op，INT16 MAC 仍走同一 grid。
+  - **inPC_ch 34–52 dB**（输入 recon 改善）**未传导**到 Conv 输出：fp32
+    conv + PC dequant 仍 52+ dB，说明瓶颈在 **INT16 int32 MAC 域**
+    （非 input grid 形态 alone；见 W11/W13）。
+  - **下一步**：FU-2-4d — int32 MAC 保真 / sparse centered int 输入专项。
+
+（复现：`bash scripts/run-in-container.sh python examples/sys_fu2_per_channel_audit.py --max-calib-batches 16`）
+
+### SYS-FU-2-W11 FU-2-4b MAC/requant 分解（容器实跑，2026-06-10；W13 修正）
+
+脚本：`examples/sys_fu2_conv_requant_audit.py`（``hw_rq`` replay 须在
+``INT16_FIXED_EVAL`` 内，见 W13）
+
+| module | inpc_fp | int16 | mac_fp | or_rq | hw_rq | hw=e2e |
+|---|---:|---:|---:|---:|---:|---:|
+| `freq_downs.0.conv2d` | 53.41 | 4.34 | **36.50** | 52.60 | **4.34** | inf |
+| `freq_downs.1.conv2d` | 52.31 | 1.69 | **35.49** | 50.30 | **1.69** | inf |
+| `freq_downs.2.conv2d` | inf | 4.88 | **27.42** | 48.96 | **4.88** | inf |
+
+- **结论 #1 — 输出 requant 不是瓶颈（修正）**：在 ``INT16_FIXED_EVAL`` 内
+  replay ``requantize_int`` 时 **``hw_rq ≈ int16_e2e``**（``hw=e2e = inf`` =
+  逐点相等）。初版 W11 将 ``hw_rq`` 误报为 52 dB，根因见 W13。
+- **结论 #2 — mac 域离散化损失 ~17–25 dB（修正）**：``mac_fp``/``fp32dir``
+  仅 27–36 dB；``inpc_fp`` 53 dB 含 **QDQ 二次量化** 增益（见 W14），
+  不能作为同 grid MAC 上界。
+- **结论 #3 — ``or_rq`` 是 mac 域 float oracle 上界**：ideal/or 在 mac 域
+  **~52 dB**；hw ``M/rshift`` 因 **ADR-015 prod sat** 仅 ~6 dB（W15）。
+- **对 FU-2-4 channel-align**：``max(S_pc)=S_pt`` 时 align no-op；根治需
+  **requantize 乘积位宽**（FU-2-4e/W15），非 align alone。
+
+### SYS-FU-2-W13 FU-2-4c dispatch vs hook requant parity（闭合，2026-06-10）
+
+脚本：`examples/sys_fu2_4c_dispatch_parity.py`
+
+| 检查项 | 结果 |
+|---|---|
+| ``to_float(mod_out)`` vs manual dequant(kernel) | max\|diff\|=0，SQNR ~5.96 dB |
+| ``replay inside INT16 == kout.int_repr`` | **True** |
+| ``replay outside INT16 == kout.int_repr`` | **False** → SQNR **53 dB 假阳性** |
+
+- **根因**：``requantize_int32_prod_sat_enabled()`` 仅在
+  ``ExecutionMode.INT16_FIXED_EVAL`` 下为 True。上下文外 replay 走不同
+  ``requantize_int`` 分支，acc 上手工 requant 可虚高 ~48 dB，造成
+  「``hw_rq`` 很好、e2e 很差」假象。
+- **dispatch 自洽**：``module(x_pc)`` 返回的 ``FixedPointSimTensor`` 与
+  kernel ``_requantize_output`` 输出同一对象/int_repr；``to_float`` 路径
+  无额外 wrap 损失。
+- **审计纪律**：所有 hook 捕获 acc 后的 ``requantize_int`` replay 必须包在
+  ``int16_eval_allow_debug_float()`` + ``quant_execution_mode(INT16_FIXED_EVAL)``。
+  ``sys_fu2_conv_requant_audit.py`` 已修正；parity 脚本显式对比 in/out 模式。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_4c_dispatch_parity.py``）
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_4c_dispatch_parity.py``）
+
+### SYS-FU-2-W14 FU-2-4d int32 MAC 保真 / sparse input（闭合，2026-06-10）
+
+脚本：`examples/sys_fu2_4d_mac_fidelity.py`
+
+| module | inpc_fp | fp32dir | mac_i32 | sat% | zero% | Sratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `freq_downs.0.conv2d` | 53.41 | **36.50** | **36.50** | 0.00 | 59.08 | 1.00 |
+| `freq_downs.1.conv2d` | 52.31 | **35.49** | **35.49** | 0.00 | 81.66 | 1.00 |
+| `freq_downs.2.conv2d` | inf | **27.42** | **27.42** | 0.00 | 95.11 | 1.00 |
+
+- **结论 #1 — int32 MAC 实现保真**：``mac_i32 == mac_i64 == mac_fp_rd``，且
+  ``fp32dir``（``F.conv2d`` on PC-dequant，不经 QDQ re-wrap）与 ``mac_i32``
+  **逐点一致**（SQNR 同值）。im2col + int64 MAC + INT32 sat 无额外损失。
+- **结论 #2 — INT32 累加饱和不是瓶颈**：``sat% = 0``（int32 逐 MM sat 与
+  int64 末端单次 sat 结果相同）。
+- **结论 #3 — W11 ``inpc_fp`` 上界需降格解读**：53 dB 来自
+  ``module(x_pc_dq)`` 在 ``FP32_QDQ`` 下 **生产 per-tensor input quantizer
+  二次 QDQ**，而非同一离散 grid 上的 fp32 MAC 上界。同一 PC-dequant grid
+  的真上界是 ``fp32dir ≈ mac_i32 ≈ 36 dB``。
+- **结论 #4 — sparse centered int 是现象不是 MAC bug**：``zero%`` 59–95%
+  （freq_downs 越深越稀疏），但 int/fp32 在同一 dequant grid 上已对齐；
+  稀疏性解释不了 36→4 dB 的 e2e 落差（W15：**ADR-015 acc×M INT32 prod sat**）。
+- **精度链（修正）**：ref → **mac 域 ~36 dB**（8-bit 输入离散化）；
+  mac 域 → **e2e ~6 dB**（``acc*M`` prod sat 后 ``>>r``，W15）；
+  ``or_rq ~52 dB`` = mac 域 float oracle 上界（**hw_ns** 可达，非当前 hw_rq）。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_4d_mac_fidelity.py --max-calib-batches 16``）
+
+### SYS-FU-2-W15 FU-2-4e ``real_m`` / ``M,rshift`` 编码审计（闭合，2026-06-10）
+
+脚本：`examples/sys_fu2_4e_output_encoding_audit.py`
+
+| module | mac | or_rq | ideal | hw_rq | hw_ns | e2e | psat% | m_rel% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `freq_downs.0.conv2d` | 36.50 | 52.60 | 52.60 | **4.34** | **52.59** | 4.34 | **63.0** | 0.000 |
+| `freq_downs.1.conv2d` | 35.49 | 50.30 | 50.30 | **1.69** | **50.19** | 1.69 | **81.4** | 0.001 |
+| `freq_downs.2.conv2d` | 27.42 | 48.96 | 48.96 | **4.88** | **48.96** | 4.88 | **59.4** | 0.000 |
+
+- **结论 #1 — ``M,rshift`` 编码正确**：``eff_m = M/2**r`` 与
+  ``real_m = S_x·S_w/S_y`` 中位相对误差 **< 0.001%**；``hw_rq == hw_rm ==
+  hw_der == e2e``，dispatch / export / 重算 ``quantize_multiplier`` 一致。
+- **结论 #2 — ``or_rq``/``ideal`` 上界可达**：float ``round(acc·real_m+Z_y)``
+  与 ``round(mac_fp/S_y+Z_y)`` 均 **~52 dB**（与 W11 ``or_rq`` 对齐）。
+- **结论 #3 — 根因在 ADR-015 ``acc*M`` INT32 prod sat（非 M 误差）**：
+  硬件路径 ``saturate_int32(acc*M)`` 后再 ``>>r``；**63–81%** 乘积超 INT32
+  宽度被截断。去掉 prod sat（``hw_ns``，仅诊断）SQNR **≈ or_rq**。
+- **结论 #4 — 修正精度链**：mac 域 36 dB → e2e 6 dB 的 **~30 dB 落差**来自
+  **requantize 中间乘积位宽**，不是 ``real_m`` 公式或 output clip（``clip%≈0``）。
+- **修复方向（FU-2-5 前置）**：在 ``quantize_multiplier`` / dispatch 侧保证
+  ``|acc·M| < 2^31``（更大 ``rshift`` fold、acc 预移位、或 spec 允许的 64-bit
+  prod）；或验证 Ada200 硬件是否真需 INT32 prod sat。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_4e_output_encoding_audit.py --max-calib-batches 16``）
+
+### SYS-FU-2-W16 FU-2-5 E2E Top-1 实跑（2026-06-10）
+
+命令（容器 ``quant-gru-cuda128``，全量 test，calib=100）::
+
+    bash scripts/run-in-container.sh python examples/quick_start_int16_metric.py \
+      --native-trans --modes int16_fixed_eval
+
+配置：``mrnn_acceptance_mixed_precision.json``，``percentile=99.5``，
+``--native-trans``（STFT fp32 黑盒 leaf）。
+
+| 模式 | Top-1 | vs float_native | logits cosine |
+|---|---:|---:|---:|
+| ``float_native`` | **95.55%** | baseline | — |
+| ``int16_fixed_eval`` | **1.68%** | **−93.87 pp** | **0.019** |
+
+- **验收**：目标 Top-1 ≥ 90% → **未达标**（≈ random 12-class 的 8% 量级）。
+- **与 W15 一致**：teacher-forced 下单层 mac→e2e 落差 ~30 dB；全图 logits
+  cosine **0.019**（早前 4-batch smoke 为 −0.27 / Top-1 0%），规模实跑略
+  好但仍 **≪ 0.999** 接入阈值。
+- **根因链闭合**：非 dispatch bug（W13）、非 MAC 实现（W14）、非 ``M,rshift``
+  编码（W15）；**ADR-015 ``acc×M`` INT32 prod sat** 在全图累积后摧毁分类边界。
+- **下一步**：修复 requant 乘积位宽（``hw_ns`` 路径 ~52 dB 单步上界）后再
+  复跑本命令验收。
+
+### SYS-FU-2-W17 prod-sat 修复 + E2E 复跑（2026-06-10）
+
+**代码**：``requantize_int32_prod_sat_enabled()`` 不再在
+``INT16_FIXED_EVAL`` 下默认开启；与 spec 05 一致——默认 ``int64`` 乘积
+直通 ``>>r``，仅 ``AIMET_RX_REQUANTIZE_INT32_SAT=1`` / ``HW_REF`` 启用
+严格 INT32 prod sat。
+
+**单步验收**（``sys_fu2_conv_requant_audit.py``，teacher-forced fd0）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---:|---:|
+| ``int16_e2e`` | 4.34 dB | **52.59 dB** |
+| ``hw_rq`` | 4.34 dB | **52.59 dB**（= ``or_rq``） |
+
+**全图 E2E**（同 W16 命令）：
+
+| 模式 | Top-1（W16） | Top-1（W17） |
+|---|---:|---:|
+| ``float_native`` | 95.55% | 95.55% |
+| ``int16_fixed_eval`` | 1.68% | **4.04%**（cosine 0.017） |
+
+- Conv requant 单步 **已闭合**；全图仍崩溃 → 瓶颈转移到 **其他层**
+  （GRU / CLN / ConvT chained / mac 域 36 dB 等，见 W12/W14）。
+- 严格 HW prod-sat 回归：``AIMET_RX_REQUANTIZE_INT32_SAT=1`` 可恢复旧路径。
+
+### SYS-FU-2-W18 全图分段瓶颈初查（2026-06-10，post W17）
+
+脚本：``examples/sys_fu2_segment_probe.py`` + ``quick_start_int16_metric.py
+--per-node-cosine``
+
+**结论：下一瓶颈在 frontend 累积，非 ConvT/GRU 首 domino。**
+
+| 区段 | isolated SQNR | chained SQNR | 备注 |
+|---|---:|---:|---|
+| ``freq_downs.0.conv2d`` | **59.95** | 14.64 | W17 后 isolated 已恢复；chn 仍差 → **上游输入坏** |
+| ``freq_downs.2.conv2d`` | 48.96 | **−4.24** | 深层 Conv 链式崩溃 |
+| ``enc_seqs.0.conv_t`` | 40.81 | 9.32 | ConvT 单步尚可，链式大降 |
+| ``neck_seqs.1.conv_t`` | 35.77 | **−0.16** | |
+| ``fft2band`` (block chn) | — | **−8.24 dB** | 进 backbone 前已毁 |
+
+**Frontend per-node（``cos_cum`` = 全图累积；``cos_local`` = 单步 QDQ）**：
+
+| 节点 | cos_cum | cos_local | 解读 |
+|---|---:|---:|---|
+| ``pre_bn.module_mul_1`` | **0.28** | 0.996 | 纯 upstream 累积 |
+| ``hypot_fun.module_square`` | **0.27** | 1.000 | 纯 upstream 累积 |
+| ``fft2band.module_matmul`` | **0.35** | 0.999 | MatMul 单步 OK，输入已坏 |
+| ``power_compress_1.module_sign`` | 0.67 | **0.67** | **早期即 intrinsic 损伤** |
+| ``power_compress_2.module_sign`` | 0.32 | 1.000 | upstream 主导 |
+
+- **GRU ``*.seq_t``**：black-box，hook/chained n/a（``diagnose_int16_readiness[blackbox_native_ops]`` 4 项）。
+- **CLN ``*.module_div_*``**：isolated cos≈0（SYS-LIMIT-2 EPS 语义差，非本段主因）。
+- **优先级**：① ``power_compress_1`` / ``pre_bn`` 早期 QDQ（16-bit activation grid）；②
+  fft2band 8-bit input 配置（SYS-OPEN-Q-2）；③ ConvT/GRU 在 frontend 修复后再查。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_segment_probe.py``）
+
+### SYS-FU-2-W19 frontend 根因闭合（2026-06-10，post W18）
+
+脚本：``examples/sys_fu2_frontend_probe.py``（calib=16，eval=80 batch）
+
+**根因**：``power_compress_1.module_sign`` 在 **input Q 开启**（``sign_input_bypass=OFF``）
+时，STFT 近零样本（``near_zero_frac≈12%``，``sign flip risk=100%`` 通道）在 16-bit
+grid 上 round 到 0，整数 ``sign(centered)`` 丢失符号 → ``iso_dB=0.00``、``cos_local=0.67``。
+与 ``MRNN_SingleOp_LUT_Validation.md §3.1`` 一致（非 sign 公式错误）。
+
+**修复**（W19 代码）：
+
+1. ``adapter.py``：当 sign **input Q bypass**（``mrnn_clz_encoding`` 默认）时，
+   ``INT16_FIXED_EVAL`` 走 ``sign_int16_from_float_input``（float 输入上取 sign 再 requant），
+   不再 ``return None`` 崩溃。
+2. ``quick_start_int16_metric.build_sim``：新增 ``sign_input_bypass`` 参数供 probe 对照。
+
+| 配置 | Top-1（80 batch） | ``module_sign`` iso | pc1 worst local |
+|---|---:|---:|---|
+| ``sign_bypass=OFF`` | **17.38%** | **0.00 dB** | sign ``cos_local=0.67`` |
+| ``sign_bypass=ON``（修复后） | **79.84%** | inf | sqrt ``cos_local=0.72`` |
+
+- **验收路径**：全量 test 复跑（calib=100）：``int16_fixed_eval`` **76.87%**
+  （W17 基线 4.04% 为 ``sign_input_bypass=False``；cosine **0.814**）。
+
+**全图 E2E**（同 W16 命令，post W19）：
+
+| 模式 | Top-1（W17） | Top-1（W19） |
+|---|---:|---:|
+| ``float_native`` | 95.55% | 95.55% |
+| ``int16_fixed_eval`` | 4.04% | **76.87%**（cosine 0.814） |
+
+- sign 根因 **已闭合**；距验收 ≥90% 仍差 **~13 pp** → 下一刀 ``module_sqrt`` / ``pre_bn`` / backbone chained。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_frontend_probe.py``）
+
+### SYS-FU-2-W20 整数 sign encoding 可行性（2026-06-10）
+
+脚本：``examples/sys_fu2_sign_encoding_sweep.py``（``sign_bypass=OFF``，calib=16）
+
+**问题**：硬件仅允许 spec §4.3.6 ``sign(q_x−Z_x)`` 时，能否靠 **input scale 调参**
+（非 QAT、非 bypass）使 ``sign_agreement(Q_in)≥0.99`` 且 ``sat≤1%``？
+
+| 节点 | PTQ scale | PTQ agree | Pareto（agree≥0.99 时 min sat） | sat≤1% 可行？ |
+|---|---:|---:|---:|---|
+| ``power_compress_1.module_sign`` | 3.56e-3 | **0.57** | **3.62%** @ scale≈1.56e-5（agree=0.993） | **否** |
+| ``power_compress_2.module_sign_1`` | 1.22e-4 | 1.00 | 0% @ PTQ scale | **是**（sat=0.67%） |
+
+- **pc1 根因**：STFT 动态范围（p99.5 |x|≈0.67）与近零符号敏感区（12% ``|x|<1e-4``）
+  在 **单一对称 i16 scale** 下不可同时满足「符号保真」与「无饱和」——
+  agree→1.0 需 scale≈2e-9，sat **92.8%**；PTQ scale 下 agree 仅 **~0.57**。
+- **pc2** 输入分布更窄，PTQ 已 agree=1.0；与 pc1 不同构。
+- **QAT 权重**不能消解该离散边界（``MRNN_SingleOp §3.1`` + W19 扫参 +0.4 pp 已证伪）。
+- **W21 修正**：``sat≤1%`` 不应作为 **sign 专用输入分支**门禁；sign 只关心
+  ``q_x − Z_x`` 的正/负/零，幅值饱和不改变符号。真正缺口是 sign 输出 scale。
+- **可行出路**（待立项）：① STFT→pc1 边界 **专用更细粒度编码**（非全局单 scale，
+  如 per-frame / per-band）；② 硬件在 STFT 出口保留 **sub-LSB sign 比较**（spec 扩展）；
+  ③ 验收分层：pc1 用 ``sign_agreement(Q_in)`` 门禁 + 全图 E2E，而非强行单 scale 双达标。
+
+（复现：``bash scripts/run-in-container.sh python examples/sys_fu2_sign_encoding_sweep.py``）
+
+### SYS-FU-2-W21 硬件整数 sign 路径修复（2026-06-10，post W20）
+
+脚本：``examples/sys_fu2_sign_encoding_sweep.py --apply-best`` +
+``examples/quick_start_int16_metric.py``（默认 ``sign_input_bypass=False``）
+
+**修正点**：严格硬件 sign 不需要 bypass，也不需要 sign 输入幅值保真；但必须同时满足：
+
+1. **sign input fine scale**：``module_sign`` input Q 用符号专用 fine scale
+   （默认 ``2e-9``），让 STFT 近零非零值不被 round 到 0；输入幅值饱和允许。
+2. **sign output unit grid**：``module_sign`` output 设为 spec unit grid
+   （i8, scale=1, zp=0），使输出码 ``{-1,0,1}`` 在下游解读为实值 ``{-1,0,1}``。
+
+**为什么 W20 apply-best 仍 17.38%**：当时只修 input scale，输出 quantizer 仍是普通
+16-bit 小 scale；整数 kernel 输出码 ``±1`` 被下游解读成 ``±scale``，幅值几乎为 0。
+
+| 路径 | ``module_sign`` iso | Top-1（80 batch） | 备注 |
+|---|---:|---:|---|
+| ``sign_bypass=OFF`` baseline | 0.00 dB | 17.38% | input Q 丢符号 |
+| input fine scale only | 0.00 dB | 17.38% | 输出 unit 语义未修 |
+| **input fine scale + output unit grid** | **inf** | **79.84%** | 硬件整数 sign，无 bypass |
+| W19 bypass | inf | 79.84% | float sign 参考路径 |
+
+**主流程变更**：
+
+- ``quick_start_int16_metric.py`` 默认 ``sign_input_bypass=False``，对齐硬件整数 sign。
+- ``apply_mrnn_clz_encoding_fixes_post_calib`` 新增 ``sign_input_scale`` /
+  ``sign_output_unit``，在 ``convert_encodings_to_fixed_scale`` 前写入。
+- 短测（calib=16, eval=80）：``int16_fixed_eval`` **79.84%**，cosine **0.820**；
+- 全量 test（calib=100）：``int16_fixed_eval`` **76.87%**，cosine **0.814**；
+  与 W19 bypass 结果一致，但部署语义改为硬件整数 sign。
+
+（复现：``bash scripts/run-in-container.sh python examples/quick_start_int16_metric.py --native-trans --modes int16_fixed_eval --max-calib-batches 16 --max-eval-batches 80``）
+
+### SYS-FU-2-W22 frontend mixed-precision priority 修复（2026-06-10，post W21）
+
+脚本：``examples/sys_fu2_frontend_probe.py``、``examples/sys_fu2_segment_probe.py``、
+``examples/quick_start_int16_metric.py``
+
+**根因修正**：W21 后硬件整数 sign 已闭合，但 full INT16 仍只有 76.87%。
+继续分段后发现 ``power_compress_1.module_sqrt`` / ``pre_bn`` 本身不是 kernel
+错误：``pc1`` 出口 chained SQNR **46.72 dB**、``pre_bn.module_add``
+**41.81 dB**。剩余损失来自 frontend chained QDQ 边界，且 acceptance config 中
+``power_compress_1.*`` / ``hypot_fun.*`` 通配未开启 ``pattern_priority``，
+被默认 layer type 的 8-bit 配置抢先匹配。
+
+**修复**：
+
+1. ``examples/config/mrnn_acceptance_mixed_precision.json`` 顶层开启
+   ``"pattern_priority": true``，让显式 module-tree wildcard 覆盖 type 默认。
+2. ``power_compress_1.*``、``hypot_fun.*``、``pre_bn.*`` 保持 16-bit；
+3. ``power_compress_2.*`` **显式保持 8-bit**。实测若 pc2 也随通配升 16-bit，
+   ``power_compress_2.module_mul_2`` chained SQNR 跌到 **0.53 dB**，Top-1 仅
+   **3.32%**；保持 8-bit 后 pc2 chained 回到 **8.97 dB**，E2E 通过。
+
+| 配置 | Top-1（80 batch） | 关键 chained SQNR |
+|---|---:|---|
+| W21 baseline | 79.84% | ``fft2band=-8.06 dB`` |
+| ``pattern_priority=true``，pc2 也 16-bit | 3.32% | ``pc2.mul=0.53 dB`` |
+| **W22：pc1/hypot/pre_bn 16-bit，pc2 8-bit** | **92.73%** | ``fft2band=14.82 dB``、``pc2.mul=8.97 dB`` |
+
+**全量验收**（calib=100，全 test）：
+
+| 模式 | Top-1 | Δ vs ``float_native`` |
+|---|---:|---:|
+| ``float_native`` | 95.55% | — |
+| ``int16_fixed_eval`` | **92.89%** | **-2.66 pp** |
+
+结论：FU-2-5 的 Top-1 ≥90% 已达成；W22 修复的是 mixed-precision 配置优先级与
+pc2 精度档位选择，不改变 W21 的硬件整数 sign 语义。
+
+（复现：``bash scripts/run-in-container.sh python examples/quick_start_int16_metric.py --native-trans --modes int16_fixed_eval --max-calib-batches 100``）
+
+### SYS-FU-2-W23 pc2 全 16-bit 闭合（2026-06-10，post W22）
+
+**目标**：``power_compress_2.*`` 全 16-bit（硬件约束），同时 E2E ≥90%。
+
+**根因（pc2 16-bit 全链初版）**：
+
+| 节点 | 修复前 pc2 全 16-bit | Abs adapter 修复后 pc2 全 16-bit |
+|---|---:|---:|
+| ``module_abs_2`` iso | **0.03 dB** | **inf** |
+| ``module_mul_2`` chn | 0.53 dB | **8.67 dB** |
+| Top-1（80 batch） | 3.09% | **92.66%** |
+
+- 第一崩点是 ``power_compress_2.module_abs_2``，但不是 Abs kernel 公式错误；
+  根因在 adapter 将 ``custom.Abs`` 放进 ``_UNARY_GRID_ONLY_OUTPUT_OPS``，
+  导致 Abs 只拿 output grid，跳过 ``real_m = S_x / S_y`` 的 ``M/rshift``
+  重标定。pc2 16-bit 的正域/跨 grid 下因此单步掉到 ~0 dB。
+- 修复：``adapter.py`` 中 ``_UNARY_GRID_ONLY_OUTPUT_OPS`` 只保留
+  ``custom.ElementwiseUnarySign``，``custom.Abs`` 回到正常 ``M/rshift`` 输出编码。
+- ``sign`` fine input scale 仅作用于 ``power_compress_1.module_sign``（pc2 输入为幅度，不需 STFT fine scale）。
+
+**当前可部署配置**（``mrnn_acceptance_mixed_precision.json``）：
+
+- ``power_compress_2.*`` → **16-bit**（无 ``module_abs_2`` 例外）
+
+**编码修复**（``mrnn_clz_encoding.py``）：
+
+- ``fix_positive_clamp_output_encodings``：``module_clamp_2/3/4`` 输出 unsigned
+- ``fix_power_compress_2_positive_encodings``：pc2 sign/abs/sqrt/mul 正域 range
+
+**验证**：
+
+- Abs 单测：``pytest tests/fixed_point/kernels/test_relu_int16_precision.py -k abs -q``
+  → **4 passed**。
+- 短测（calib=16, eval=80）：``int16_fixed_eval`` **92.66%**（vs float_native -1.91 pp）。
+- 全量验收（calib=100，全 test）：``int16_fixed_eval`` **92.89%**
+  （``float_native`` 95.55%，Δ=-2.65 pp）。
+
+### SYS-FU-2-W24 QAT smoke（2026-06-10，post W23）
+
+目的：确认 W23 后 QAT 是否能继续提升 ``int16_fixed_eval``。
+
+实验矩阵（eval=80 batch）：
+
+| QAT mode | scope | steps | lr | cache | post-QAT Top-1 | Δ vs 92.66% |
+|---|---|---:|---:|---:|---:|---:|
+| ``fp32_qdq`` | weights | 50 | 1e-5 | 4 batches | 92.66% | +0.00 pp |
+| ``int16_fixed_qat_sim`` | weights | 20 | 1e-5 | 2 batches | 92.66% | +0.00 pp |
+| ``fp32_qdq`` | weights | 200 | 3e-5 | off | 92.66% | +0.00 pp |
+| ``fp32_qdq`` | head | 200 | 1e-4 | off | 92.66% | +0.00 pp |
+
+观察：
+
+- 严格 ``int16_fixed_qat_sim`` backward 可跑通（QuantGRU 有梯度），但 20 steps 未提升。
+- ``fp32_qdq`` 快路径下，200 steps weights/head-only 均无可见 Top-1 改善，loss 也未呈现稳定下降趋势。
+- 当前 QAT 实现使用 SGD、冻结 quantizer 参数和 BN affine，只更新模型权重；W23 后主要瓶颈已由 kernel/encoding 修复闭合，剩余 ~2.6 pp 更可能来自 activation/chained noise 与固定 encoding，而非短程权重微调。
+
+结论：当前 QAT smoke/短跑 **未带来可见提升**。QAT 不再是达标必要条件；若继续追求接近
+``float_native``，需要升级 QAT recipe（更长 epoch + val checkpoint、优化器/LR schedule、
+更大 batch/更多数据、多 seed），而不是简单增加 50/200 steps。
+
+### SYS-FU-2-W25 升级 QAT recipe（2026-06-10，post W24）
+
+**代码改动**（``qat_train.py`` + ``quick_start_int16_metric.py``）：
+
+- ``run_int16_qat_epochs`` 支持 **Adam**、**CosineAnnealingLR**、**val checkpoint**（仅快照可训练权重）。
+- val 选模指标改为 ``int16_fixed_eval``（非 ``fp32_qdq``），与交付口径一致。
+- CLI 新增 ``--qat-optimizer adam|sgd``、``--qat-lr-scheduler``、``--qat-val-batches``、``--no-qat-restore-best``。
+
+**Trial A**（2 epoch × 100 batch，Adam lr=3e-5，Cosine，fp32_qdq 训练，val=50 batch）：
+
+| 指标 | 值 |
+|---|---:|
+| val before QAT | 94.75% |
+| epoch1 val / loss_mean | **95.00%** / 5.48 |
+| epoch2 val / loss_mean | 94.81% / 3.71 |
+| val restored | **95.00%**（epoch1 checkpoint） |
+| post-QAT test ``int16_fixed_eval``（80 batch） | **92.93%**（vs PTQ 92.66%，**+0.27 pp**） |
+| 同批 ``float_native`` | 94.57%（Δ=-1.64 pp） |
+
+观察：
+
+- loss 从 ~8 稳定降至 ~3.7，说明 **训练步数不足是 W24 无增益的主因之一**。
+- val 可达 95%，但 test 仅 +0.27 pp → **val/test 口径差异 + 固定 encoding 仍限制 E2E 上限**。
+- epoch2 val 略降，restore_best 必要。
+
+**Trial B**（3 epoch × 200 batch，同 recipe）：
+
+| 指标 | 值 |
+|---|---:|
+| epoch2 val（best） | **94.94%** |
+| post-QAT test ``int16_fixed_eval``（80 batch） | **92.89%**（vs PTQ 92.66%，+0.23 pp） |
+
+**W25 结论**：
+
+- W24 无增益 **主因是训练不够**（loss 未降）+ **无 val 选模** + SGD；升级 recipe 后 loss 稳定下降，test 有 **+0.2~0.3 pp** 小幅提升。
+- val 可达 ~95%，但 test E2E 仍 ~92.9% → **固定 encoding / chained activation noise** 仍是上限；单纯加长 epoch 未继续推高（Trial B ≤ Trial A）。
+- 逼近全量 test **94–95%** 需：**全量 train 多 epoch**、**encoding/scale 联合微调**（或 QAT 后 re-calib），而非仅权重 Adam 微调。
+
+### SYS-FU-2-W26 M_Po2 + re-calib（2026-06-10）
+
+**实现**（``aimet_torch/m_po2_quantization.py`` + ``--apply-m-po2``）：
+
+- 与 legacy Po2（``scale=1/2^n``, M=1）不同：**M_Po2** 用 ``frexp`` 将每层 scale snap 到 ``M/2^n``（**M 可>1**），写回 AIMET encoding。
+- 流程：PTQ calib → **pre-snap** → ``compute_encodings`` **re-calib** → **post-snap** → CLZ post_calib → ``convert_encodings_to_fixed_scale``。
+
+**Smoke**（W23 验收配置，eval=80 batch）：
+
+| calib batch | 配置 | ``int16_fixed_eval`` |
+|---:|---|---:|
+| 16 | 默认（无 Po2/M_Po2） | 92.66% |
+| 16 | ``--apply-m-po2`` | **92.46%**（-0.20 pp） |
+| 100 | 默认（全量验收） | **92.89%** |
+| 100 | ``--apply-m-po2`` | **92.30%**（-0.59 pp vs 16-calib 默认） |
+
+结论：M_Po2+re-calib **未提升** 92.89% 基线；calib 加大后 M_Po2 路径反而更差（92.30%）。snap 写回 float encoding 与 W21–W23 手工 fix 不同步。默认路径已在 ``convert_encodings_to_fixed_scale`` **离线**生成 ``M/2^n``，**不必**再写回 AIMET float scale。
+
+### SYS-FU-2-W27 全量 QAT + encoding re-calib（2026-06-10）
+
+**代码增强**：
+
+- ``qat_train.py``：每 epoch 调用 ``set_train_mode_freeze_bn``（对齐 ``quick_start.qat_finetune``）。
+- ``--qat-val-mode fp32_qdq|int16_fixed_eval``、``--qat-val-batches -1``（全量 val）。
+- ``--qat-post-encoding-recalib``：QAT 后对 calib 重跑 ``compute_encodings`` + CLZ post_calib + ``convert_encodings_to_fixed_scale``。
+
+**Trial**（calib=100, QAT 1×400 batch, Adam 1e-4, cosine, post-encoding-recalib, eval=80）：
+
+| 项 | 值 |
+|---|---:|
+| fp32_qdq val（选模） | **3.57%**（本 sim 上 fp32_qdq val **不可用**，≈随机） |
+| post-QAT ``int16_fixed_eval`` | **92.62%**（vs PTQ 92.66%，-0.04 pp） |
+
+观察：400 batch QAT + encoding re-calib **未超过** W25 最佳 92.93%；``fp32_qdq`` val 在该 ``ensure_output_quantizers`` sim 上与 int16 脱节，**val 选模应固定 ``int16_fixed_eval``**（已改 CLI 默认）。
+
+### SYS-FU-2-W12 FU-2-2 / FU-2-3 teacher-forced 实跑（2026-06-10）
+
+**FU-2-2**（`sys_fu2_frontend_ablation.py`，isolated SQNR dB）：
+
+| scope | fd0.conv2d | fd1 | fd2 | enc0.conv_t |
+|---|---:|---:|---:|---:|
+| conv_in_only | n/a | n/a | n/a | n/a |
+| conv_in_fd0 | 3.56 | n/a | n/a | n/a |
+| conv_down | 3.56 | 1.92 | 1.45 | n/a |
+
+scope 外模块无 activation quant → isolated INT16 不适用（n/a）。``conv_down``
+三档 freq_downs isolated **1.5–3.6 dB**，与 W8 outPT 一致。
+
+**FU-2-3**（`sys_fu2_convt_upstream.py`，``cand_mode=INT16_FIXED_EVAL``）：
+
+| module | iso (INT16) | chn (INT16) |
+|---|---:|---:|
+| enc_seqs.0.conv_t | 5.19 | 0.17 |
+| enc_seqs.1.conv_t | 2.23 | -0.88 |
+| neck_seqs.0.conv_t | 2.76 | -0.61 |
+| neck_seqs.1.conv_t | 2.54 | -0.52 |
+
+- **isolated INT16 亦仅 2–5 dB**（非早前误报的 59 dB——彼为
+  ``per_layer_isolated_cosine`` 默认 ``FIXED_SCALE_QDQ`` cand）。
+- **chained 更差（~0 dB / 负 SQNR）** → ConvT 与 freq_downs 同属全图崩溃；
+  W7「ConvT 输入分布健康」仍成立，但 **单步 INT16 也不够**。
+- upstream_only 全图 forward 在 CLN/sub 等 op 未实现 ``FixedPointSimTensor``
+  算术时失败，``chn_up``/``iso_up`` 暂 n/a。
+
+### SYS-FU-2 剩余任务
+
+| ID | 任务 | 状态 |
+|---|---|---|
+| **FU-2-4c** | dispatch 返回 vs hook acc-requant 一致性 | ✅ W13 闭合 |
+| **FU-2-4d** | int32 MAC 保真 / sparse input 专项 | ✅ W14 闭合 |
+| **FU-2-4e** | ``real_m`` / ``M,rshift`` 编码审计 | ✅ W15 闭合 |
+| **FU-2-3b** | ConvT **chained** SQNR 表（baseline vs upstream） | 新 |
+| **FU-2-5** | E2E Top-1 ≥ 90% | ✅ W22 全量 92.89%（vs float_native -2.66 pp） |
+| **FU-2-6** | 全图分段瓶颈（frontend vs backbone） | ✅ W18 初查 |
+| **FU-2-6b** | frontend sign / pre_bn 根因 | ✅ W22 frontend mixed precision 闭合 |
+| **FU-2-6c** | pc1 整数 sign encoding（非 bypass） | ✅ W21 input fine scale + output unit grid |
 
 **不在本工单范围**（已有 owner）：
 - SYS-LIMIT-2 / CLN EPS（R1 重训）

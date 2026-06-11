@@ -143,7 +143,7 @@ return Int16QuantizedTensor(int_repr.clamp(qmin, qmax), ...)
 2. 新增 `encoding.py`，`InputEncoding` / `OutputEncoding` dataclass。
 3. 实现 `from_float` / `to_float` / `saturate` / `to`。
 4. 在 `aimet_torch/v2/quantization/affine/encoding.py` 增加序列化字段：
-   - `to_dict()` 写入 `multiplier_int16`, `rshift_int8`, `bias_int32_path`, `lut_path`。
+   - `to_dict()` 写入 `multiplier_uint16`, `rshift_int8`, `bias_int32_path`, `lut_path`。
    - `from_dict()` 读取并填充对应字段，缺失时为 None。
 5. 单元测试覆盖 dtype / shape / 不可变性 / 序列化兼容。
 
