@@ -806,6 +806,88 @@ class cfLN2D(torch.nn.Module):
         return output
 
 
+class cLN2D(torch.nn.Module):
+    """Spec §4.5.7 ``cLN2D`` — variance-normalize over ``(C,F)`` with
+    no mean-subtract and no affine.
+
+    Project default lives in ``[B, C, T, F]`` layout. The spec reference
+    code (``doc/04_算子详细规格/04_05_归一化类算子.md`` §4.5.7) computes
+    ``var`` over the flattened ``(C·F)`` axis via einops; this is
+    equivalent to ``torch.var(y, dim=(1, 3), keepdim=True, unbiased=False)``
+    for the 4D ``[B, C, T, F]`` layout, so we use the latter to avoid an
+    einops dependency. Output shape ``[B, C, T, F]`` matches input.
+
+    Implementation style mirrors :class:`cfLN2D` — explicit ``Add`` /
+    ``Sqrt`` / ``Divide`` operator modules so AIMET's v2
+    ``QuantizationMixin`` can intercept each step and dispatch to the
+    matching INT16 sub-op kernel. There is no ``γ`` / ``β`` (spec §4.5.7
+    explicitly excludes affine).
+
+    See ``precision_validation.md`` ``§D2-4.5.7`` for the path-rationale
+    and the ``FU-NORM-SUBOP-VS-DSP-PARITY`` follow-up tracking the
+    deferred DSP-single-instruction parity work.
+    """
+
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.add = Add()
+        self.sqrt = Sqrt()
+        self.divide = Divide()
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        var = torch.var(y, dim=(1, 3), keepdim=True, unbiased=False)
+        var_eps = self.add(var, self.eps)
+        std = self.sqrt(var_eps)
+        return self.divide(y, std)
+
+
+class SimCln2d(torch.nn.Module):
+    """Spec §4.5.8 ``SimCln2d`` — L1-norm normalize over ``(C,F)`` with
+    optional inverse path (multiply by saved ``std``).
+
+    Forward: ``std = mean(|x|, dim=(1,3)) + ε`` ; ``y = x / std`` ; the
+    ``std`` is saved to ``self.std`` (matches spec line 933-936) so the
+    downstream :meth:`inverse` can restore the original scale. Inverse:
+    ``y = x · self.std`` (spec line 938-948).
+
+    Implementation style mirrors :class:`cfLN2D` / :class:`cLN2D` —
+    explicit ``Abs`` / ``Add`` / ``Divide`` / ``Multiply`` operator
+    modules so AIMET's v2 ``QuantizationMixin`` can intercept each step.
+    The ``self.std`` cache is **not** a buffer (it is assigned from the
+    forward output and lives only across one ``forward`` /
+    ``inverse`` pair) — this matches the spec reference module so
+    quantization observers see ``self.std`` as a regular activation
+    flowing through the explicit op chain.
+
+    See ``precision_validation.md`` ``§D2-4.5.8`` for the path-rationale
+    and the ``FU-NORM-SUBOP-VS-DSP-PARITY`` follow-up.
+    """
+
+    def __init__(self, eps: float = 0.009765625):
+        super().__init__()
+        self.eps = eps
+        self.std: Optional[torch.Tensor] = None
+        self.abs = Abs()
+        self.add = Add()
+        self.divide = Divide()
+        self.multiply = Multiply()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        abs_x = self.abs(x)
+        mean = torch.mean(abs_x, dim=(1, 3), keepdim=True)
+        self.std = self.add(mean, self.eps)
+        return self.divide(x, self.std)
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        if self.std is None:
+            raise RuntimeError(
+                "SimCln2d.inverse: forward must be called once before "
+                "inverse so that self.std is populated."
+            )
+        return self.multiply(x, self.std)
+
+
 class Snake2d(torch.nn.Module):
     """Snake2d activation module"""
     

@@ -16,6 +16,7 @@ import warnings
 from aimet_torch.fixed_point.kernels import conv_linear  # noqa: F401
 from aimet_torch.fixed_point.kernels import clz_lut  # noqa: F401
 from aimet_torch.fixed_point.kernels import lut  # noqa: F401
+from aimet_torch.fixed_point.kernels import norm  # noqa: F401
 
 # Optional kernels: pull in AIMET ``custom`` nn modules, which require torchvision.
 try:
@@ -30,4 +31,4 @@ except ImportError as exc:
         stacklevel=1,
     )
 
-__all__ = ["clz_lut", "conv_linear", "lut", "eltwise", "pool", "shape_ops"]
+__all__ = ["clz_lut", "conv_linear", "lut", "norm", "eltwise", "pool", "shape_ops"]
