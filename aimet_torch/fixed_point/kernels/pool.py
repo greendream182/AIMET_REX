@@ -17,7 +17,15 @@ from torch import nn
 import torch.nn.functional as F
 
 from aimet_torch._base.nn.modules import custom
+from aimet_torch.fixed_point.capabilities import KernelKind
 from aimet_torch.fixed_point.encoding import OutputEncoding
+from aimet_torch.fixed_point.kernels._contracts import (
+    require_adaptive_avgpool_output_unit,
+    require_int32_saturated_accumulator,
+    require_kernel_kind_encoding_contract,
+    require_pool2d_operand_limits,
+    require_reduce_size_matches_extra,
+)
 from aimet_torch.fixed_point.kernels._im2col import im2col_int
 from aimet_torch.fixed_point.registry import register_fixed_kernel
 from aimet_torch.fixed_point.requantize import (
@@ -28,6 +36,14 @@ from aimet_torch.fixed_point.requantize import (
     saturate_sim_tensor,
 )
 from aimet_torch.fixed_point.tensor import Int16QuantizedTensor
+
+# Spec doc/04_算子详细规格/04_09 pinned set: {2x2, 4x4, 4x2, 2x4}.
+_AVGPOOL_ALLOWED_KERNELS: Tuple[Tuple[int, int], ...] = (
+    (2, 2),
+    (4, 4),
+    (4, 2),
+    (2, 4),
+)
 
 
 def _as_tuple(value: Any, ndim: int) -> Tuple[int, ...]:
@@ -73,12 +89,24 @@ class _MaxPool2dKernel:
     ) -> Int16QuantizedTensor:
         del params
         x = _single_input(inputs)
+        require_kernel_kind_encoding_contract(
+            KernelKind.SAME_GRID_VALUE,
+            output_encoding,
+            op_name="MaxPool2d",
+            tensor=x,
+        )
         kernel_size = _as_tuple(extra.get("kernel_size", 1), 2)
         stride = extra.get("stride", kernel_size)
         stride = _as_tuple(stride, 2)
         padding = _as_tuple(extra.get("padding", 0), 2)
         dilation = _as_tuple(extra.get("dilation", 1), 2)
         ceil_mode = bool(extra.get("ceil_mode", False))
+        require_pool2d_operand_limits(
+            kernel_size=kernel_size,
+            padding=padding,
+            op_name="MaxPool2d",
+            max_kernel=3,
+        )
 
         y = F.max_pool2d(
             x.int_repr,
@@ -114,14 +142,31 @@ class _AvgPool2dKernel:
         extra: Dict[str, Any],
     ) -> Int16QuantizedTensor:
         del params
-        if output_encoding.multiplier is None or output_encoding.rshift is None:
-            raise ValueError("AvgPool output encoding must provide multiplier/rshift.")
+        require_kernel_kind_encoding_contract(
+            KernelKind.REQUANTIZING,
+            output_encoding,
+            op_name="AvgPool2d",
+        )
 
         x = _single_input(inputs)
         kernel_size = _as_tuple(extra.get("kernel_size", 1), 2)
         stride = extra.get("stride", kernel_size)
         stride = _as_tuple(stride, 2)
         padding = _as_tuple(extra.get("padding", 0), 2)
+        require_pool2d_operand_limits(
+            kernel_size=kernel_size,
+            padding=padding,
+            op_name="AvgPool2d",
+            allowed_kernels=_AVGPOOL_ALLOWED_KERNELS,
+        )
+        # Spec 04_09 folds 1/N (N=k_t*k_f) into output ``M/rshift``; the
+        # adapter must publish that N so a stale-extra path cannot silently
+        # mis-scale the result.
+        require_reduce_size_matches_extra(
+            extra.get("reduce_size"),
+            kernel_size[0] * kernel_size[1],
+            op_name="AvgPool2d",
+        )
 
         # Pure-integer im2col (see _im2col.py). int32 container preserves
         # values exactly within the [qmin, qmax] grid (ADR-013).
@@ -139,9 +184,11 @@ class _AvgPool2dKernel:
         centered = unfolded - x.zero_point.to(device=unfolded.device, dtype=torch.int32)
         acc = int32_sum_sat(centered.view(n_batch, channels, kernel_area, -1), dim=2)
         acc = acc.view(n_batch, channels, out_h, out_w)
+        acc_sat = saturate_mac_accumulator(acc)
+        require_int32_saturated_accumulator(acc_sat, op_name="AvgPool2d")
 
         y = requantize_int(
-            saturate_mac_accumulator(acc),
+            acc_sat,
             output_encoding.multiplier.to(device=acc.device),
             output_encoding.rshift.to(device=acc.device),
             output_encoding.zero_point.to(device=acc.device, dtype=torch.int32),
@@ -169,9 +216,13 @@ class _MeanInt16Kernel:
     """Reference INT16 reduce-mean kernel.
 
     The adapter folds ``1/N`` (with ``N`` the product of the reduced-axis
-    lengths) into the output ``real_multiplier``, so this kernel only needs
-    to accumulate the zero-centered int values and pass them through
-    ``requantize_int``.
+    lengths) into the output ``real_multiplier`` and publishes that ``N`` via
+    ``extra["reduce_size"]``. This kernel re-derives ``N`` from ``dim`` plus
+    the input shape and asserts equality through
+    :func:`require_reduce_size_matches_extra`, so any adapter path that
+    forgets / mis-folds ``1/N`` raises immediately rather than producing a
+    silently mis-scaled output. Once that contract holds, the kernel only
+    needs to zero-centre, accumulate, and pass through ``requantize_int``.
     """
 
     def __call__(
@@ -182,25 +233,43 @@ class _MeanInt16Kernel:
         extra: Dict[str, Any],
     ) -> Int16QuantizedTensor:
         del params
-        if output_encoding.multiplier is None or output_encoding.rshift is None:
-            raise ValueError("Mean output encoding must provide multiplier/rshift.")
+        require_kernel_kind_encoding_contract(
+            KernelKind.REQUANTIZING,
+            output_encoding,
+            op_name=type(self).__name__,
+        )
 
         x = _single_input(inputs)
+        require_adaptive_avgpool_output_unit(
+            output_size=extra.get("output_size"),
+            op_name=type(self).__name__,
+        )
         dim = extra.get("dim")
         if dim is None:
             dims: Tuple[int, ...] = tuple(range(x.int_repr.dim()))
         elif isinstance(dim, int):
-            dims = (int(dim),)
+            dims = (int(dim) % x.int_repr.dim(),)
         else:
-            dims = tuple(int(d) for d in dim)
+            dims = tuple(int(d) % x.int_repr.dim() for d in dim)
         keepdim = bool(extra.get("keepdim", False))
+
+        derived_reduce_size = 1
+        for d in dims:
+            derived_reduce_size *= int(x.int_repr.shape[d])
+        require_reduce_size_matches_extra(
+            extra.get("reduce_size"),
+            derived_reduce_size,
+            op_name=type(self).__name__,
+        )
 
         zp = x.zero_point.to(device=x.int_repr.device, dtype=torch.int32)
         centered = x.int_repr.to(torch.int32) - zp
         acc = int32_sum_sat(centered, dim=dims, keepdim=keepdim)
+        acc_sat = saturate_mac_accumulator(acc)
+        require_int32_saturated_accumulator(acc_sat, op_name=type(self).__name__)
 
         y = requantize_int(
-            saturate_mac_accumulator(acc),
+            acc_sat,
             output_encoding.multiplier.to(device=acc.device),
             output_encoding.rshift.to(device=acc.device),
             output_encoding.zero_point.to(device=acc.device, dtype=torch.int32),

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import gc
 import time
-from typing import Callable, Iterable, Iterator, Literal, Optional
+from typing import Callable, Iterable, Iterator, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -22,9 +22,36 @@ import torch.nn.functional as F
 
 from aimet_torch.fixed_point.execution_mode import ExecutionMode, quant_execution_mode
 from aimet_torch.fixed_point.qat.carrier import clear_int16_carriers
+from aimet_torch.utils_rx import set_train_mode_freeze_bn
 from aimet_torch.v2.utils import enable_recompute, no_recompute
 
 QatTrainScope = Literal["weights", "head", "all"]
+QatOptimizerName = Literal["sgd", "adam"]
+
+
+def _make_qat_optimizer(
+    trainable: list[nn.Parameter],
+    *,
+    name: QatOptimizerName,
+    lr: float,
+) -> torch.optim.Optimizer:
+    if name == "adam":
+        return torch.optim.Adam(trainable, lr=lr)
+    if name == "sgd":
+        return torch.optim.SGD(trainable, lr=lr)
+    raise ValueError(f"optimizer must be 'sgd' or 'adam'; got {name!r}.")
+
+
+def _snapshot_trainable_state(trainable: list[nn.Parameter]) -> list[torch.Tensor]:
+    return [p.detach().cpu().clone() for p in trainable]
+
+
+def _restore_trainable_state(
+    trainable: list[nn.Parameter],
+    snapshot: list[torch.Tensor],
+) -> None:
+    for param, saved in zip(trainable, snapshot, strict=True):
+        param.data.copy_(saved.to(param.device, non_blocking=torch.cuda.is_available()))
 
 
 def release_qat_grads(model: nn.Module | None = None) -> None:
@@ -228,6 +255,7 @@ def run_int16_qat_steps(
 
     model.train()
     optimizer = torch.optim.SGD(trainable, lr=lr)
+    set_train_mode_freeze_bn(model, verbose=False)
     iterator: Iterator[tuple[torch.Tensor, torch.Tensor]] = iter(data_iter)
 
     losses: list[torch.Tensor] = []
@@ -283,6 +311,8 @@ def run_int16_qat_epochs(
     epochs: int,
     lr: float = 1e-4,
     scope: QatTrainScope = "weights",
+    optimizer: QatOptimizerName = "sgd",
+    lr_scheduler: bool = False,
     grad_clip_norm: Optional[float] = 1.0,
     max_batches_per_epoch: Optional[int] = None,
     loss_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
@@ -293,10 +323,14 @@ def run_int16_qat_epochs(
     activation_recompute: bool = False,
     log_timing: bool = False,
     check_finite_every: int = 1,
-) -> list[dict[str, float]]:
+    val_loader: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None,
+    val_fn: Optional[Callable[[nn.Module], float]] = None,
+    restore_best: bool = True,
+) -> list[dict[str, Union[float, str]]]:
     """Run ``epochs`` passes over ``train_loader``; return per-epoch stats.
 
-    Each entry is ``{"epoch", "batches", "loss_mean", "loss_last"}``.
+    Each entry includes ``epoch``, ``batches``, ``loss_mean``, ``loss_last``;
+    when ``val_fn`` is set, also ``val_top1`` (and ``val_restored`` on the last row).
     """
 
     if epochs <= 0:
@@ -310,10 +344,25 @@ def run_int16_qat_epochs(
         loss_fn = lambda logits, labels: F.cross_entropy(logits, labels)
 
     model.train()
-    optimizer = torch.optim.SGD(trainable, lr=lr)
-    history: list[dict[str, float]] = []
+    optim = _make_qat_optimizer(trainable, name=optimizer, lr=lr)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)
+        if lr_scheduler and epochs > 0
+        else None
+    )
+    history: list[dict[str, Union[float, str]]] = []
+
+    best_val = -1.0
+    best_state: list[torch.Tensor] | None = None
+    if val_loader is not None and val_fn is not None and restore_best:
+        model.eval()
+        best_val = val_fn(model)
+        best_state = _snapshot_trainable_state(trainable)
+        print(f"  [INT16 QAT] val before QAT: {best_val * 100:.2f}%", flush=True)
+        model.train()
 
     for epoch in range(epochs):
+        set_train_mode_freeze_bn(model, verbose=False)
         batch_losses: list[torch.Tensor] = []
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             if max_batches_per_epoch is not None and batch_idx >= max_batches_per_epoch:
@@ -322,7 +371,7 @@ def run_int16_qat_epochs(
                 loss_val = _int16_qat_optimizer_step(
                     model,
                     trainable,
-                    optimizer,
+                    optim,
                     inputs,
                     labels,
                     device,
@@ -356,13 +405,39 @@ def run_int16_qat_epochs(
         if not batch_losses:
             raise RuntimeError("train_loader yielded no batches for INT16 QAT.")
         loss_values = [float(loss.detach().cpu()) for loss in batch_losses]
-        history.append(
-            {
-                "epoch": float(epoch + 1),
-                "batches": float(len(loss_values)),
-                "loss_mean": sum(loss_values) / len(loss_values),
-                "loss_last": loss_values[-1],
-            }
+        row: dict[str, Union[float, str]] = {
+            "epoch": float(epoch + 1),
+            "batches": float(len(loss_values)),
+            "loss_mean": sum(loss_values) / len(loss_values),
+            "loss_last": loss_values[-1],
+        }
+        if scheduler is not None:
+            row["lr"] = scheduler.get_last_lr()[0]
+            scheduler.step()
+
+        if val_loader is not None and val_fn is not None:
+            model.eval()
+            val_acc = val_fn(model)
+            row["val_top1"] = val_acc
+            print(
+                f"  [INT16 QAT] epoch {epoch + 1}/{epochs} "
+                f"val Top-1={val_acc * 100:.2f}%",
+                flush=True,
+            )
+            if restore_best and val_acc >= best_val:
+                best_val = val_acc
+                best_state = _snapshot_trainable_state(trainable)
+            model.train()
+
+        history.append(row)
+
+    if restore_best and best_state is not None:
+        _restore_trainable_state(trainable, best_state)
+        if history:
+            history[-1]["val_restored"] = best_val
+        print(
+            f"  [INT16 QAT] restored best val checkpoint: {best_val * 100:.2f}%",
+            flush=True,
         )
 
     return history

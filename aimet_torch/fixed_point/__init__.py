@@ -61,6 +61,7 @@ from aimet_torch.fixed_point.offline import (
     generate_pwl_lut,
     pwl_lut_from_json_dict,
     pwl_lut_to_json_dict,
+    quantize_bias_int,
     quantize_bias_int32,
     quantize_multiplier,
     quantize_scale_to_m_rshift,
@@ -79,6 +80,17 @@ from aimet_torch.fixed_point.sim_utils import (
     iter_missing_output_quantizers,
 )
 from aimet_torch.fixed_point.diagnose import diagnose_int16_readiness, is_int16_ready
+from aimet_torch.fixed_point.quant_grid import (
+    GRID_I8,
+    GRID_I16,
+    GRID_I32,
+    GRID_U8,
+    GRID_U16,
+    GRID_U32,
+    SIM_INT32_QUANT_GRIDS,
+    STANDARD_QUANT_GRIDS,
+    QuantGridSpec,
+)
 from aimet_torch.fixed_point.tensor import FixedPointSimTensor, Int16QuantizedTensor
 
 # Phase B export (sidecar JSON); import subpackage explicitly to avoid v2 import at root.
@@ -90,6 +102,15 @@ __all__ = [
     "FixedKernel",
     "FixedPointSimTensor",
     "FixedScaleEncoding",
+    "GRID_I8",
+    "GRID_I16",
+    "GRID_I32",
+    "GRID_U8",
+    "GRID_U16",
+    "GRID_U32",
+    "QuantGridSpec",
+    "SIM_INT32_QUANT_GRIDS",
+    "STANDARD_QUANT_GRIDS",
     "convert_encodings_to_fixed_scale",
     "dequantize_with_fixed_scale",
     "fixed_point_tensor_bundle",
@@ -121,6 +142,7 @@ __all__ = [
     "iter_missing_output_quantizers",
     "list_registered_kernels",
     "quant_execution_mode",
+    "quantize_bias_int",
     "quantize_bias_int32",
     "quantize_dequantize_from_float_encoding",
     "quantize_dequantize_with_fixed_scale",

@@ -28,9 +28,12 @@ from typing import Optional, TYPE_CHECKING
 
 import torch
 
+from aimet_torch.fixed_point.quant_grid import MAX_SEMANTIC_LEVELS
 from aimet_torch.fixed_point.requantize import (
     INT16_QMAX,
     INT16_QMIN,
+    INT32_QMAX,
+    INT32_QMIN,
     SIM_TENSOR_DTYPE,
     saturate_sim_tensor,
 )
@@ -86,16 +89,16 @@ class FixedPointSimTensor:
             )
 
         num_levels = int(self.qmax) - int(self.qmin) + 1
-        if (
-            self.qmin < INT16_QMIN
-            or self.qmax > UINT16_QMAX
-            or num_levels <= 0
-            or num_levels > MAX_16BIT_LEVELS
-        ):
+        if num_levels <= 0 or num_levels > MAX_SEMANTIC_LEVELS:
             raise ValueError(
-                f"qmin/qmax ({self.qmin}, {self.qmax}) must describe a <=16-bit "
-                f"semantic grid within [{INT16_QMIN}, {UINT16_QMAX}] "
-                "until >16bit quantizers are supported (ADR-014)."
+                f"qmin/qmax ({self.qmin}, {self.qmax}) describe {num_levels} levels; "
+                f"valid range is [1, {MAX_SEMANTIC_LEVELS}]."
+            )
+        if self.qmin < INT32_QMIN or self.qmax > INT32_QMAX:
+            raise ValueError(
+                f"qmin/qmax ({self.qmin}, {self.qmax}) exceed the int32 sim-tensor "
+                f"container [{INT32_QMIN}, {INT32_QMAX}] (e.g. full u32 needs int64; "
+                "ADR-013 follow-up)."
             )
 
         if self.zero_point.dtype != torch.int32:
@@ -121,6 +124,9 @@ class FixedPointSimTensor:
         scale: torch.Tensor,
         zero_point: torch.Tensor,
         axis: Optional[int] = None,
+        *,
+        qmin: int = INT16_QMIN,
+        qmax: int = INT16_QMAX,
     ) -> FixedPointSimTensor:
         """Quantize a floating-point tensor into a sim-tensor container."""
 
@@ -134,11 +140,13 @@ class FixedPointSimTensor:
         scale = scale.to(device=tensor.device, dtype=torch.float32)
         zero_point = zero_point.to(device=tensor.device, dtype=torch.int32)
         quantized = torch.round(tensor / scale + zero_point.to(torch.float32))
-        int_repr = saturate_sim_tensor(quantized, INT16_QMIN, INT16_QMAX)
+        int_repr = saturate_sim_tensor(quantized, qmin, qmax)
         return cls(
             int_repr=int_repr,
             scale=scale,
             zero_point=zero_point,
+            qmin=qmin,
+            qmax=qmax,
             axis=axis,
         )
 

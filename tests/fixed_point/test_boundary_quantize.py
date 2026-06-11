@@ -17,9 +17,11 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn as nn  # noqa: E402
 
+from aimet_torch.fixed_point import ExecutionMode, quant_execution_mode
 from aimet_torch.fixed_point.boundary_quantize import (
     int16_boundary_use_m_r,
     quantize_boundary_from_affine,
+    should_use_fixed_scale_boundary,
 )
 from aimet_torch.fixed_point.offline.scale_fixed import (
     clear_fixed_scale_encoding_cache,
@@ -56,6 +58,16 @@ def test_boundary_m_r_can_differ_from_affine_grid():
     # Grids align in intent; int_repr may differ when (M,r) approximates scale.
     assert q_affine.int_repr.dtype is SIM_TENSOR_DTYPE
     assert q_fixed.int_repr.dtype is SIM_TENSOR_DTYPE
+
+
+def test_int16_fixed_eval_uses_m_r_boundary_without_env(monkeypatch):
+    m = QuantizedLinear(2, 2)
+    _init_linear(m)
+    enc = m.input_quantizers[0].get_encodings()
+    clear_fixed_scale_encoding_cache(enc)
+    monkeypatch.delenv("AIMET_RX_INT16_BOUNDARY_USE_M_R", raising=False)
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_EVAL):
+        assert should_use_fixed_scale_boundary(enc)
 
 
 def test_env_disables_m_r_without_cache(monkeypatch):

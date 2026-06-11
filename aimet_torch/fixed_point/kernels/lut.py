@@ -16,6 +16,9 @@ import torch
 from torch import nn
 
 from aimet_torch.fixed_point.encoding import InputEncoding, OutputEncoding
+from aimet_torch.fixed_point.kernels._contracts import (
+    require_int64_within_int32_range,
+)
 from aimet_torch.fixed_point.kernels.softmax import softmax_int16_pwl
 from aimet_torch.fixed_point.offline.lut_gen import (
     align_op_quant_grid_to_lut_quant_grid,
@@ -29,6 +32,7 @@ from aimet_torch.fixed_point.requantize import (
     INT16_QMIN,
     SIM_TENSOR_DTYPE,
     _env_truthy,
+    _forbid_float_fallback_in_eval,
     hw_ref_mode_enabled,
     round_shift,
     saturate_int32,
@@ -170,6 +174,7 @@ def evaluate_pwl_lut_int16(
         prod = _sat_int32_acc(
             centered.to(torch.int64) * q_b.index_select(0, segment_idx).to(torch.int64)
         )
+        require_int64_within_int32_range(prod, op_name="PWL.prod")
     else:
         prod = centered.to(torch.int64) * q_b.index_select(0, segment_idx).to(torch.int64)
 
@@ -179,6 +184,7 @@ def evaluate_pwl_lut_int16(
     y = shifted + term_c.index_select(0, segment_idx).to(torch.int64)
     if hw_ref:
         y = _sat_int32_acc(y)
+        require_int64_within_int32_range(y, op_name="PWL.y_pre_output_clamp")
     y = saturate_sim_tensor(y, output_qmin, output_qmax)
     return y.view(x_int16.shape)
 
@@ -366,13 +372,6 @@ class LogInt16Kernel(_LutInt16Kernel):
     module_type = custom.Log
 
 
-@register_fixed_kernel(custom.Abs)
-class AbsInt16Kernel(_LutInt16Kernel):
-    """INT16 PWL kernel for ``custom.Abs`` (PowerCompress / frontend)."""
-
-    module_type = custom.Abs
-
-
 @register_fixed_kernel(nn.Softmax)
 class SoftmaxInt16Kernel:
     """INT16 Softmax: PWL ``exp`` + integer sum (default), or legacy float reference."""
@@ -390,6 +389,7 @@ class SoftmaxInt16Kernel:
             raise ValueError(f"SoftmaxInt16Kernel expects 1 input; got {len(inputs)}.")
         dim = int(extra.get("dim", params.get("dim", -1)))
         if extra.get("legacy_float_softmax"):
+            _forbid_float_fallback_in_eval("legacy_float_softmax")
             with int16_eval_allow_debug_float():
                 x_float = inputs[0].to_float()
             y_float = torch.softmax(x_float, dim=dim)

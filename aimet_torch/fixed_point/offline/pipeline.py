@@ -141,7 +141,7 @@ def _layer_freeze_report(
     report: dict[str, Any] = {
         "op": base_cls.__name__,
         "status": "ok",
-        "multiplier_int16": output_encoding_to_dict(out_enc).get("multiplier"),
+        "multiplier_uint16": output_encoding_to_dict(out_enc).get("multiplier"),
         "rshift_int8": output_encoding_to_dict(out_enc).get("rshift"),
         "relative_error": rel_err,
     }

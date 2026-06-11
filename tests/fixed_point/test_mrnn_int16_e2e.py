@@ -49,9 +49,38 @@ def _has_quant_gru() -> bool:
         return False
 
 
+def _quantgru_supports_native_forward_quantized() -> bool:
+    """Whether QuantGRU exposes ``forward_quantized`` as a native method.
+
+    AIMET's INT16_FIXED_EVAL refuses the float round-trip stub by design (it
+    is not bit-exact); without a native ``forward_quantized``, end-to-end
+    INT16_FIXED_EVAL paths through QuantGRU intentionally raise
+    ``RuntimeError``. quant-gru-pytorch v1.0.5 (2026-06-05) has not landed
+    the native AIMET contract v1 surface yet, so the affected tests skip
+    on that build rather than block CI on an upstream gap.
+    """
+    if not _has_quant_gru():
+        return False
+    try:
+        from quant_gru import QuantGRU
+    except ImportError:
+        return False
+    return hasattr(QuantGRU, "forward_quantized")
+
+
 pytestmark = pytest.mark.skipif(
     not (_has_quant_gru() and torch.cuda.is_available()),
     reason="QuantGRU integration requires quant_gru + CUDA (use quant-gru-cuda128 container)",
+)
+
+
+requires_native_forward_quantized = pytest.mark.skipif(
+    not _quantgru_supports_native_forward_quantized(),
+    reason=(
+        "QuantGRU.forward_quantized native is not exposed on this "
+        "quant-gru-pytorch build; AIMET INT16_FIXED_EVAL requires bit-exact "
+        "native and refuses the float stub by design."
+    ),
 )
 
 
@@ -177,6 +206,7 @@ def test_quantgru_skipped_by_missing_oq_scan(gru_only_sim):
     assert all(class_name != "QuantizedQuantGRU" for _, class_name in missing)
 
 
+@requires_native_forward_quantized
 def test_int16_fixed_eval_forward_on_quantgru(gru_only_sim):
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
 
@@ -192,6 +222,7 @@ def test_int16_fixed_eval_forward_on_quantgru(gru_only_sim):
     assert isinstance(hn_q, Int16QuantizedTensor)
 
 
+@requires_native_forward_quantized
 def test_int16_fixed_eval_no_kernel_not_found(gru_only_sim):
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
 
@@ -211,6 +242,7 @@ def test_backbone_has_quantized_quantgru(backbone_sim):
     assert len(quant_grus) == 1
 
 
+@requires_native_forward_quantized
 def test_backbone_quantgru_int16_submodule(backbone_sim):
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
 
@@ -241,6 +273,7 @@ def test_backbone_fp32_qdq_forward(backbone_sim):
     assert y.dtype == torch.float32
 
 
+@requires_native_forward_quantized
 def test_backbone_staged_int16_at_gru_boundary(backbone_sim):
     """分段 INT16：FP32_QDQ 跑到 GRU 边界，再对 QuantGRU 单独 INT16 dispatch。"""
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
@@ -278,6 +311,7 @@ def test_backbone_diagnose_int16_ready(backbone_sim):
     assert report["uncalibrated_quantgru"] == []
 
 
+@requires_native_forward_quantized
 def test_backbone_segment_int16_e2e_forward(backbone_sim):
     """全图 INT16 e2e（含 QuantGRU bit-exact 边界 + Conv/Linear 浮点 fallback 路径）。"""
     sim = backbone_sim["sim"]

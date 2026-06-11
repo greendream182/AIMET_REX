@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from aimet_torch._base.nn.modules import custom
+from aimet_torch.fixed_point.capabilities import is_exportable
 from aimet_torch.fixed_point.encoding import InputEncoding, OutputEncoding
 from aimet_torch.fixed_point.encoding_export import _tensor_int_json
 from aimet_torch.fixed_point.offline.clz_gen import (
@@ -339,6 +340,11 @@ def collect_v2_int16_layer_record(
 
     base_cls = QuantizationMixin.qcls_to_cls.get(type(qmodule))
     if base_cls is None:
+        return None
+    if not is_exportable(base_cls):
+        # Manifest gate: skip ops the capability manifest declares as
+        # non-exportable (e.g. blackbox/planned). Today all IMPLEMENTED ops
+        # are exportable, so this is a safety net for future entries.
         return None
     try:
         get_fixed_kernel(base_cls)

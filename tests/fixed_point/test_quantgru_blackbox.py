@@ -182,6 +182,15 @@ def test_check_adapter_version_raises(calibrated_fake_gru, monkeypatch):
         check_adapter_version(calibrated_fake_gru)
 
 
+def test_forward_quantized_stub_rejected_in_int16_eval(calibrated_fake_gru):
+    x = torch.randn(1, 2, 4)
+    with quant_execution_mode(ExecutionMode.INT16_FIXED_EVAL):
+        with pytest.raises(RuntimeError, match="native forward_quantized"):
+            from aimet_torch.fixed_point.quantgru_adapter import forward_quantized
+
+            forward_quantized(calibrated_fake_gru, x)
+
+
 def test_dispatch_quantgru_blackbox_int16_eval(calibrated_fake_gru, monkeypatch):
     def _fake_forward_quantized(module, input, hx=None):
         del module, hx

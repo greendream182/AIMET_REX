@@ -18,11 +18,16 @@ import torch.nn.functional as F
 
 from aimet_torch._base.nn.modules import custom
 from aimet_torch.fixed_point.encoding import OutputEncoding
-from aimet_torch.fixed_point.kernels._im2col import im2col_int
+from aimet_torch.fixed_point.kernels._contracts import (
+    require_int32_saturated_accumulator,
+)
+from aimet_torch.fixed_point.kernels._im2col import im2col_int, im3col_int
 from aimet_torch.fixed_point.registry import register_fixed_kernel
 from aimet_torch.fixed_point.requantize import (
     SIM_TENSOR_DTYPE,
     _env_truthy,
+    _forbid_float_fallback_in_eval,
+    int16_fixed_eval_mode,
     mac_accumulator_int32_sat_enabled,
     requantize_int,
     saturate_mac_accumulator,
@@ -40,17 +45,68 @@ def _get_weight(params: Dict[str, Any]) -> Int16QuantizedTensor:
     weight = params.get("weight")
     if not isinstance(weight, Int16QuantizedTensor):
         raise TypeError("params['weight'] must be an Int16QuantizedTensor.")
+    _require_weight_zero_point_zero(weight)
     return weight
 
 
-def _get_bias(params: Dict[str, Any], device: torch.device) -> torch.Tensor:
+def _require_weight_zero_point_zero(weight: Int16QuantizedTensor) -> None:
+    """Conv/Linear weights must use ``Z_w = 0`` (symmetric) per spec 04_01.
+
+    The hardware requantize path expands the GEMM as
+    ``sum_i q_w_i * (q_x_i - Z_x)`` (no ``Z_w`` term). A non-zero weight
+    zero_point would introduce an additional ``-Z_w * sum(q_x)`` correction
+    that the hardware comparator/MAC has no path for, so the simulator must
+    refuse it instead of producing silently wrong numerics.
+    Reference: ``doc/04_算子详细规格/04_01_卷积类算子.md`` §量化推导.
+    """
+
+    zp = weight.zero_point
+    if zp is None:
+        return
+    if torch.is_tensor(zp):
+        if torch.any(zp != 0):
+            raise ValueError(
+                "Conv/Linear weight zero_point must be 0 per spec 04_01 "
+                "(symmetric quantize); got non-zero values "
+                f"{zp.detach().cpu().tolist()!r}."
+            )
+        return
+    if int(zp) != 0:
+        raise ValueError(
+            "Conv/Linear weight zero_point must be 0 per spec 04_01 "
+            f"(symmetric quantize); got {int(zp)}."
+        )
+
+
+def _get_bias(
+    params: Dict[str, Any],
+    device: torch.device,
+    bias_bits: int = 32,
+) -> torch.Tensor:
+    """Validate and return the integer bias for Conv/Linear kernels.
+
+    ``bias_bits`` is sourced from :class:`OutputEncoding` and selects the
+    expected storage container per spec 04_01:
+    * ``32`` → ``torch.int32`` (legacy/simulator default; matches MAC width)
+    * ``16`` → ``torch.int16`` (hardware canonical bias dtype)
+
+    The MAC accumulator stays in int32; ``_add_bias`` up-casts the bias at
+    add-time, so this validator only enforces the storage contract.
+    """
+
+    if bias_bits not in (16, 32):
+        raise ValueError(f"output_encoding.bias_bits must be 16 or 32; got {bias_bits}.")
+    expected_dtype = torch.int16 if bias_bits == 16 else torch.int32
     bias = params.get("bias")
     if bias is None:
-        return torch.zeros((), dtype=torch.int32, device=device)
+        return torch.zeros((), dtype=expected_dtype, device=device)
     if not isinstance(bias, torch.Tensor):
         raise TypeError("params['bias'] must be a torch.Tensor when provided.")
-    if bias.dtype != torch.int32:
-        raise TypeError(f"params['bias'] must be torch.int32; got {bias.dtype}.")
+    if bias.dtype != expected_dtype:
+        raise TypeError(
+            f"output_encoding.bias_bits={bias_bits} requires dtype "
+            f"{expected_dtype}; got {bias.dtype}."
+        )
     return bias
 
 
@@ -65,8 +121,10 @@ def _requantize_output(
     if output_encoding.multiplier is None or output_encoding.rshift is None:
         raise ValueError("output_encoding must provide multiplier and rshift.")
 
+    acc_sat = saturate_mac_accumulator(acc)
+    require_int32_saturated_accumulator(acc_sat, op_name="Conv/Linear")
     int_repr = requantize_int(
-        saturate_mac_accumulator(acc),
+        acc_sat,
         output_encoding.multiplier.to(device=acc.device),
         output_encoding.rshift.to(device=acc.device),
         output_encoding.zero_point.to(device=acc.device, dtype=torch.int32),
@@ -99,30 +157,40 @@ def _add_bias(acc: torch.Tensor, bias: torch.Tensor, view_shape: Tuple[int, ...]
 
 
 def _matmul_fast_fp32_enabled() -> bool:
-    """Opt-in: use float32 CUDA matmul for speed at the cost of bit-exactness.
+    """Opt-in float32 CUDA matmul (disallowed in ``INT16_FIXED_EVAL``)."""
 
-    A single ``int16 * int16`` product can reach 2**30, exceeding float32's
-    24-bit exact-integer range (2**24); the K-accumulation diverges further.
-    This is a *fast approximate preview* only and MUST NOT back sign-off.
-    Default is float64 accumulation, which is bit-exact for int16 ranges and
-    matches the CPU integer reference across devices.
-    """
-
+    if int16_fixed_eval_mode():
+        if _env_truthy("AIMET_RX_MATMUL_FAST_FP32"):
+            _forbid_float_fallback_in_eval("AIMET_RX_MATMUL_FAST_FP32")
+        return False
     return _env_truthy("AIMET_RX_MATMUL_FAST_FP32")
 
 
 def _int32_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    """Integer MAC with CUDA-safe fallback (PyTorch CUDA lacks integer matmul)."""
+    """Integer MAC: int64 product + INT32 saturation (pure fixed-point in eval)."""
 
     if mac_accumulator_int32_sat_enabled():
-        prod = torch.matmul(lhs.to(torch.float64), rhs.to(torch.float64))
-        return saturate_mac_accumulator(prod.to(torch.int64))
+        device = lhs.device
+        if device.type == "cuda" or rhs.device.type == "cuda":
+            # PyTorch CUDA lacks integer matmul; run int64 MAC on CPU (eval purity).
+            prod = torch.matmul(
+                lhs.cpu().to(torch.int64),
+                rhs.cpu().to(torch.int64),
+            )
+            return saturate_mac_accumulator(prod).to(device=device)
+        prod = torch.matmul(lhs.to(torch.int64), rhs.to(torch.int64))
+        return saturate_mac_accumulator(prod)
+
+    if int16_fixed_eval_mode():
+        raise RuntimeError(
+            "INT16_FIXED_EVAL requires mac_accumulator_int32_sat; "
+            "do not set AIMET_RX_ACC_INT32_SAT=0."
+        )
 
     if lhs.is_cuda or rhs.is_cuda:
         if _matmul_fast_fp32_enabled():
             prod = torch.matmul(lhs.to(torch.float32), rhs.to(torch.float32))
             return prod.round().to(torch.int32)
-        # Default: float64 is bit-exact for int16 operands and device-invariant.
         prod = torch.matmul(lhs.to(torch.float64), rhs.to(torch.float64))
         return prod.round().to(torch.int32)
 
@@ -145,7 +213,7 @@ class LinearInt16Kernel:
         del extra
         x = _require_single_input(inputs)
         weight = _get_weight(params)
-        bias = _get_bias(params, x.int_repr.device)
+        bias = _get_bias(params, x.int_repr.device, output_encoding.bias_bits)
 
         x_centered = _center_tensor(x)
         w_centered = _center_tensor(weight)
@@ -170,7 +238,7 @@ class Conv2dInt16Kernel:
     ) -> Int16QuantizedTensor:
         x = _require_single_input(inputs)
         weight = _get_weight(params)
-        bias = _get_bias(params, x.int_repr.device)
+        bias = _get_bias(params, x.int_repr.device, output_encoding.bias_bits)
 
         stride = _as_tuple(extra.get("stride", 1), 2)
         padding = _as_tuple(extra.get("padding", 0), 2)
@@ -181,12 +249,30 @@ class Conv2dInt16Kernel:
         w_centered = _center_tensor(weight)
 
         if mac_accumulator_int32_sat_enabled():
-            x_mac = x_centered.to(torch.float64)
-            w_mac = w_centered.to(torch.float64)
-        else:
-            x_mac = x_centered.to(torch.float32)
-            w_mac = w_centered.to(torch.float32)
+            if groups == 1:
+                acc = self._conv2d_unfold(
+                    x_centered, w_centered, bias, stride, padding, dilation
+                )
+            else:
+                acc = self._grouped_conv2d(
+                    x_centered,
+                    w_centered,
+                    bias,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                )
+            return _requantize_output(acc, output_encoding)
 
+        if int16_fixed_eval_mode():
+            raise RuntimeError(
+                "INT16_FIXED_EVAL requires integer Conv2d (im2col + int64 matmul); "
+                "do not set AIMET_RX_ACC_INT32_SAT=0."
+            )
+
+        x_mac = x_centered.to(torch.float32)
+        w_mac = w_centered.to(torch.float32)
         acc = F.conv2d(
             x_mac,
             w_mac,
@@ -196,10 +282,7 @@ class Conv2dInt16Kernel:
             dilation=dilation,
             groups=groups,
         )
-        if mac_accumulator_int32_sat_enabled():
-            acc = saturate_mac_accumulator(acc.to(torch.int64))
-        else:
-            acc = acc.round().to(torch.int32)
+        acc = acc.round().to(torch.int32)
         acc = saturate_mac_accumulator(_add_bias(acc, bias, (1, -1, 1, 1)))
 
         return _requantize_output(acc, output_encoding)
@@ -310,13 +393,63 @@ class Conv1dInt16Kernel:
 
 @register_fixed_kernel(nn.Conv3d)
 class Conv3dInt16Kernel:
-    """Reference INT16 kernel for torch.nn.Conv3d.
-
-    Default: float32 ``conv3d`` + round (e2e parity). HW ref: float64 MAC from exact
-    int64 centered operands, then :func:`saturate_mac_accumulator` (no int32 wrap).
-    """
+    """Reference INT16 kernel for torch.nn.Conv3d using im3col + int64 matmul."""
 
     module_type = nn.Conv3d
+
+    @staticmethod
+    def _conv3d_unfold(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        stride: Tuple[int, int, int],
+        padding: Tuple[int, int, int],
+        dilation: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        n_batch, _, input_d, input_h, input_w = x.shape
+        out_channels, _, kernel_d, kernel_h, kernel_w = weight.shape
+
+        x_unfold = im3col_int(
+            x.to(SIM_TENSOR_DTYPE),
+            (kernel_d, kernel_h, kernel_w),
+            dilation=dilation,
+            padding=padding,
+            stride=stride,
+        )
+        weight_matrix = weight.view(out_channels, -1)
+        acc = _int32_matmul(weight_matrix, x_unfold).transpose(1, 2)
+
+        out_d = (
+            input_d + 2 * padding[0] - dilation[0] * (kernel_d - 1) - 1
+        ) // stride[0] + 1
+        out_h = (
+            input_h + 2 * padding[1] - dilation[1] * (kernel_h - 1) - 1
+        ) // stride[1] + 1
+        out_w = (
+            input_w + 2 * padding[2] - dilation[2] * (kernel_w - 1) - 1
+        ) // stride[2] + 1
+        acc = acc.transpose(1, 2).reshape(n_batch, out_channels, out_d, out_h, out_w)
+        return saturate_mac_accumulator(_add_bias(acc, bias, (1, -1, 1, 1, 1)))
+
+    @classmethod
+    def _grouped_conv3d(
+        cls,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        stride: Tuple[int, int, int],
+        padding: Tuple[int, int, int],
+        dilation: Tuple[int, int, int],
+        groups: int,
+    ) -> torch.Tensor:
+        x_groups = x.chunk(groups, dim=1)
+        w_groups = weight.chunk(groups, dim=0)
+        bias_groups = bias.chunk(groups) if bias.numel() > 1 else [bias] * groups
+        outputs = [
+            cls._conv3d_unfold(x_g, w_g, b_g, stride, padding, dilation)
+            for x_g, w_g, b_g in zip(x_groups, w_groups, bias_groups)
+        ]
+        return torch.cat(outputs, dim=1)
 
     def __call__(
         self,
@@ -327,7 +460,7 @@ class Conv3dInt16Kernel:
     ) -> Int16QuantizedTensor:
         x = _require_single_input(inputs)
         weight = _get_weight(params)
-        bias = _get_bias(params, x.int_repr.device)
+        bias = _get_bias(params, x.int_repr.device, output_encoding.bias_bits)
 
         stride = _as_tuple(extra.get("stride", 1), 3)
         padding = _as_tuple(extra.get("padding", 0), 3)
@@ -336,15 +469,32 @@ class Conv3dInt16Kernel:
 
         x_centered = _center_tensor(x)
         w_centered = _center_tensor(weight)
-        if mac_accumulator_int32_sat_enabled():
-            mac_dtype = torch.float64
-            x_mac = x_centered.to(torch.float64)
-            w_mac = w_centered.to(torch.float64)
-        else:
-            mac_dtype = torch.float32
-            x_mac = x_centered.to(torch.float32)
-            w_mac = w_centered.to(torch.float32)
 
+        if mac_accumulator_int32_sat_enabled():
+            if groups == 1:
+                acc = self._conv3d_unfold(
+                    x_centered, w_centered, bias, stride, padding, dilation
+                )
+            else:
+                acc = self._grouped_conv3d(
+                    x_centered,
+                    w_centered,
+                    bias,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                )
+            return _requantize_output(acc, output_encoding)
+
+        if int16_fixed_eval_mode():
+            raise RuntimeError(
+                "INT16_FIXED_EVAL requires integer Conv3d (im3col + int64 matmul); "
+                "do not set AIMET_RX_ACC_INT32_SAT=0."
+            )
+
+        x_mac = x_centered.to(torch.float32)
+        w_mac = w_centered.to(torch.float32)
         acc = F.conv3d(
             x_mac,
             w_mac,
@@ -354,13 +504,8 @@ class Conv3dInt16Kernel:
             dilation=dilation,
             groups=groups,
         )
-        if mac_dtype is torch.float64:
-            acc = saturate_mac_accumulator(acc.to(torch.int64))
-        else:
-            acc = acc.round().to(torch.int32)
-        acc = saturate_mac_accumulator(
-            _add_bias(acc, bias, (1, -1, 1, 1, 1))
-        )
+        acc = acc.round().to(torch.int32)
+        acc = saturate_mac_accumulator(_add_bias(acc, bias, (1, -1, 1, 1, 1)))
 
         return _requantize_output(acc, output_encoding)
 

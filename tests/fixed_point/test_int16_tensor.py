@@ -97,7 +97,7 @@ def test_kernels_emit_sim_tensor_dtype():
             zero_point=torch.tensor(0, dtype=torch.int32),
             qmin=-32768,
             qmax=32767,
-            multiplier=torch.tensor(32767, dtype=torch.int16),
+            multiplier=torch.tensor(32767, dtype=torch.uint16),
             rshift=torch.tensor(15, dtype=torch.int8),
         )
 

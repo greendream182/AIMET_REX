@@ -44,6 +44,14 @@ def has_fixed_scale_cache(encoding) -> bool:
 def should_use_fixed_scale_boundary(encoding) -> bool:
     """Use (M,r) boundary Q when env is on or encodings were pre-converted."""
 
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.fixed_point.execution_mode import (
+        ExecutionMode,
+        get_quant_execution_mode,
+    )
+
+    if get_quant_execution_mode() is ExecutionMode.INT16_FIXED_EVAL:
+        return True
     if not int16_boundary_use_m_r():
         return has_fixed_scale_cache(encoding)
     return True

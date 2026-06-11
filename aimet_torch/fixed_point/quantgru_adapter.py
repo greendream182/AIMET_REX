@@ -81,12 +81,27 @@ def _shift_to_scale(shift: int) -> float:
     return float(2.0 ** (-int(shift)))
 
 
+def _read_scale_from_quant_params(quant_params: Any, prefix: str) -> float:
+    """Read tensor-level activation scale from QuantGRU's GRUQuantParams.
+
+    quant-gru-pytorch v1.0.5 (2026-06-05) migrated activation params to
+    scale-only fields (``scale_x_`` / ``scale_h_`` …) and dropped the legacy
+    ``shift_x_`` / ``shift_h_`` POT2-only attributes. We try the new field
+    first and fall back to the legacy one for older binding builds.
+    """
+    scale_attr = f"scale_{prefix}"
+    if hasattr(quant_params, scale_attr):
+        return float(getattr(quant_params, scale_attr))
+    shift = getattr(quant_params, f"shift_{prefix}")
+    return _shift_to_scale(shift)
+
+
 def _meta_from_quant_params(
     quant_params: Any,
     prefix: str,
     bitwidth_config: Any = None,
 ) -> Dict[str, Any]:
-    shift = getattr(quant_params, f"shift_{prefix}")
+    scale = _read_scale_from_quant_params(quant_params, prefix)
     zp = getattr(quant_params, f"zp_{prefix}", 0)
     if bitwidth_config is not None:
         bitwidth = int(getattr(bitwidth_config, prefix))
@@ -100,7 +115,7 @@ def _meta_from_quant_params(
     if is_unsigned and is_symmetric:
         is_symmetric = False
     return {
-        "scale": _shift_to_scale(shift),
+        "scale": scale,
         "zp": int(zp),
         "bitwidth": bitwidth,
         "is_symmetric": is_symmetric,
@@ -242,6 +257,11 @@ def forward_quantized(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if _native_on_quant_gru(module, "forward_quantized"):
         return _call_native(module, "forward_quantized", input, hx)
+    if get_quant_execution_mode() is ExecutionMode.INT16_FIXED_EVAL:
+        raise RuntimeError(
+            "QuantGRU native forward_quantized is required for INT16_FIXED_EVAL; "
+            "the float round-trip stub is not bit-exact."
+        )
     return stub_forward_quantized(module, input, hx)
 
 

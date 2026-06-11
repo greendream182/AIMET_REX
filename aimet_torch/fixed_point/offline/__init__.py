@@ -10,7 +10,7 @@
 # =============================================================================
 """Offline helpers for fixed-point parameter generation."""
 
-from aimet_torch.fixed_point.offline.bias import quantize_bias_int32
+from aimet_torch.fixed_point.offline.bias import quantize_bias_int, quantize_bias_int32
 from aimet_torch.fixed_point.offline.clz_gen import (
     ClzLutGenerationError,
     clz_activation_name,
@@ -89,6 +89,7 @@ __all__ = [
     "fixed_scale_float_scale",
     "fixed_scale_encoding_from_tensors",
     "get_or_create_fixed_scale_encoding",
+    "quantize_bias_int",
     "quantize_bias_int32",
     "quantize_multiplier",
     "quantize_scale_to_m_rshift",

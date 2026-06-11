@@ -84,3 +84,44 @@ def im2col_int(
     windows = windows.permute(0, 1, 4, 5, 2, 3).contiguous()
     # (N, C, kh, kw, out_h, out_w) -> reshape to (N, C*kh*kw, out_h*out_w)
     return windows.view(n, c * kh * kw, out_h * out_w)
+
+
+def im3col_int(
+    x: torch.Tensor,
+    kernel_size: Tuple[int, int, int],
+    *,
+    dilation: Tuple[int, int, int] = (1, 1, 1),
+    padding: Tuple[int, int, int] = (0, 0, 0),
+    stride: Tuple[int, int, int] = (1, 1, 1),
+    pad_value: int = 0,
+) -> torch.Tensor:
+    """Pure-integer ``im2col`` for 5-D ``(N, C, D, H, W)`` Conv3d inputs."""
+
+    if x.dim() != 5:
+        raise ValueError(f"im3col_int expects (N,C,D,H,W); got {tuple(x.shape)}.")
+    kd, kh, kw = (int(kernel_size[0]), int(kernel_size[1]), int(kernel_size[2]))
+    sd, sh, sw = (int(stride[0]), int(stride[1]), int(stride[2]))
+    dd, dh, dw = (int(dilation[0]), int(dilation[1]), int(dilation[2]))
+    pd, ph, pw = (int(padding[0]), int(padding[1]), int(padding[2]))
+
+    if pd or ph or pw:
+        x = F.pad(x, [pw, pw, ph, ph, pd, pd], value=pad_value)
+
+    eff_d = (kd - 1) * dd + 1
+    eff_h = (kh - 1) * dh + 1
+    eff_w = (kw - 1) * dw + 1
+
+    n, c, depth, height, width = x.shape
+    out_d = (depth - eff_d) // sd + 1
+    out_h = (height - eff_h) // sh + 1
+    out_w = (width - eff_w) // sw + 1
+
+    windows = x.unfold(2, eff_d, sd).unfold(3, eff_h, sh).unfold(4, eff_w, sw)
+    if dd != 1:
+        windows = windows[..., ::dd, :, :]
+    if dh != 1:
+        windows = windows[..., :, ::dh, :]
+    if dw != 1:
+        windows = windows[..., :, :, ::dw]
+    windows = windows.permute(0, 1, 5, 6, 7, 2, 3, 4).contiguous()
+    return windows.view(n, c * kd * kh * kw, out_d * out_h * out_w)

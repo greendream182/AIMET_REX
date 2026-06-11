@@ -188,10 +188,14 @@ class _FakeQuantizedUnaryOpMixin(FakeQuantizationMixin):  # pylint: disable=abst
             int16_out = _fp_adapter.dispatch_int16_fixed(self, *args, **kwargs)
             if int16_out is not None:
                 return int16_out
-            # Fall through to the float fake-quant path when dispatch refuses
-            # (e.g. unsupported output_size, missing kernel); the caller can
-            # still observe ``record_multiplier_saturations`` events emitted
-            # by earlier layers.
+            if get_quant_execution_mode() is ExecutionMode.INT16_FIXED_EVAL:
+                raise RuntimeError(
+                    f"INT16 fixed-point execution is not implemented for "
+                    f"{type(self).__name__}. Add a fixed-point kernel/adapter path "
+                    "or run in fp32_qdq/fp16_qdq mode."
+                )
+            # QAT sim may fall through to float fake-quant when dispatch refuses
+            # (e.g. unsupported AdaptiveAvgPool output_size).
 
         x, *others = args
 

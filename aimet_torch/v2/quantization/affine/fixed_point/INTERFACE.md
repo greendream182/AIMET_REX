@@ -448,7 +448,7 @@ def quantize_multiplier(
     max_rshift: int = 31,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    返回 (multiplier_int16, rshift_int8)。
+    返回 (multiplier_uint16, rshift_int8)。
 
     若 real_multiplier 为张量则按元素生成（per-channel 支持）。
     若 real_multiplier == 0 则返回 (0, 0)。

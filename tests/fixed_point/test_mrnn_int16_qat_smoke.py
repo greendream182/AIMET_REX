@@ -32,6 +32,7 @@ from aimet_torch.fixed_point import (  # noqa: E402
     quant_execution_mode,
     run_int16_qat_steps,
 )
+from aimet_torch.fixed_point.diagnose import is_int16_ready  # noqa: E402
 
 
 def _has_quant_gru() -> bool:
@@ -103,8 +104,12 @@ def mrnn_qat_bundle():
 
 
 def test_mrnn_diagnose_ready_before_qat(mrnn_qat_bundle):
-    report = diagnose_int16_readiness(mrnn_qat_bundle["sim"])
-    assert not any(report.values())
+    sim = mrnn_qat_bundle["sim"]
+    report = diagnose_int16_readiness(sim)
+    # ``blackbox_native_ops`` is informational (e.g. QuantGRU is intentionally
+    # a native blackbox) and must not block readiness; assert via the
+    # is_int16_ready predicate which already excludes informational keys.
+    assert is_int16_ready(sim), report
 
 
 def test_mrnn_int16_qat_sim_forward_backward_smoke(mrnn_qat_bundle):

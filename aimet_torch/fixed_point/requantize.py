@@ -49,8 +49,48 @@ def hw_ref_mode_enabled() -> bool:
     return _env_truthy("AIMET_RX_HW_REF") or _env_truthy("AIMET_RX_PWL_HW_REF")
 
 
+def int16_fixed_eval_mode() -> bool:
+    """True when the process is in ``INT16_FIXED_EVAL`` (G3 pure fixed-point path)."""
+
+    # pylint: disable=import-outside-toplevel
+    from aimet_torch.fixed_point.execution_mode import (
+        ExecutionMode,
+        get_quant_execution_mode,
+    )
+
+    return get_quant_execution_mode() is ExecutionMode.INT16_FIXED_EVAL
+
+
+def _forbid_float_fallback_in_eval(feature: str) -> None:
+    if int16_fixed_eval_mode():
+        raise RuntimeError(
+            f"{feature} is not allowed in INT16_FIXED_EVAL; all kernels must use "
+            "pure integer fixed-point compute."
+        )
+
+
+def sign_float_ref_enabled() -> bool:
+    """Use dequant→``torch.sign``→requant instead of integer centered sign.
+
+    Default off (integer centered sign, hardware-style). Enable with
+    ``AIMET_RX_SIGN_FLOAT_REF=1`` when the graph must match float QDQ on
+    near-zero inputs that quantize to 0 on the incoming grid (e.g. MRNN STFT).
+    """
+
+    if int16_fixed_eval_mode():
+        if _env_truthy("AIMET_RX_SIGN_FLOAT_REF"):
+            _forbid_float_fallback_in_eval("AIMET_RX_SIGN_FLOAT_REF")
+        return False
+    return _env_truthy("AIMET_RX_SIGN_FLOAT_REF")
+
+
 def requantize_int32_prod_sat_enabled() -> bool:
-    """INT32 saturate after ``acc * multiplier`` before rshift (ADR-015)."""
+    """INT32 saturate after ``acc * multiplier`` before rshift (ADR-015 strict mode).
+
+    Default **off**: ``int64`` product is kept through ``round_shift`` (spec 05,
+    e2e fidelity). Enable only for strict HW regression via
+    ``AIMET_RX_REQUANTIZE_INT32_SAT=1`` or ``AIMET_RX_HW_REF``.
+    """
 
     return _env_truthy("AIMET_RX_REQUANTIZE_INT32_SAT") or hw_ref_mode_enabled()
 
@@ -62,9 +102,11 @@ def mac_accumulator_int32_sat_enabled() -> bool:
     so we clamp to the INT32 ALU width instead of silently wrapping). Set
     ``AIMET_RX_ACC_INT32_SAT=0`` to opt out (legacy non-saturating int32 cast).
     ``AIMET_RX_HW_REF`` always forces it on.
+
+    ``INT16_FIXED_EVAL`` always forces it on (no float MAC fallback).
     """
 
-    if hw_ref_mode_enabled():
+    if hw_ref_mode_enabled() or int16_fixed_eval_mode():
         return True
     raw = os.environ.get("AIMET_RX_ACC_INT32_SAT")
     if raw is not None:
@@ -121,10 +163,8 @@ def _validate_requantize_inputs(
 ):
     if acc.dtype != torch.int32:
         raise TypeError(f"acc must be torch.int32; got {acc.dtype}.")
-    if multiplier.dtype not in (torch.int16, torch.uint16):
-        raise TypeError(
-            f"multiplier must be torch.int16 or torch.uint16; got {multiplier.dtype}."
-        )
+    if multiplier.dtype != torch.uint16:
+        raise TypeError(f"multiplier must be torch.uint16; got {multiplier.dtype}.")
     if rshift.dtype != torch.int8:
         raise TypeError(f"rshift must be torch.int8; got {rshift.dtype}.")
     if y_zp.dtype != torch.int32:

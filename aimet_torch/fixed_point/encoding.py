@@ -29,10 +29,18 @@ class InputEncoding:
 
 @dataclass(frozen=True)
 class OutputEncoding(InputEncoding):
-    """Output encoding with runtime integer requantization parameters."""
+    """Output encoding with runtime integer requantization parameters.
+
+    ``bias_bits`` selects the storage bit-width of Conv/Linear bias and is
+    one of {16, 32} (default 32). The MAC accumulator stays in int32; with
+    ``bias_bits=16`` the bias tensor is int16 and is up-cast to int32 at
+    add-time. Spec 04_01 lists ``i16`` as the canonical hardware bias dtype;
+    ``i32`` is the legacy/simulator default kept for backward compatibility.
+    """
 
     multiplier: Optional[torch.Tensor] = None
     rshift: Optional[torch.Tensor] = None
+    bias_bits: int = 32
 
 
 @dataclass(frozen=True)

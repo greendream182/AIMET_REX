@@ -184,7 +184,7 @@ def quantize_multiplier(
     *,
     saturate: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert non-negative float multiplier(s) to int16 Q-format ``(M, rshift)``.
+    """Convert non-negative float multiplier(s) to uint16 Q-format ``(M, rshift)``.
 
     ``saturate=True`` (default, spec 10 §53): when ``frexp`` yields
     ``rshift > max_rshift`` the pair is folded in-place (see

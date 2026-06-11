@@ -137,7 +137,18 @@ def test_qat_grad_matches_native_forward_quant():
 
 @requires_quant_gru_cuda
 def test_qat_grad_with_int16_upstream_carrier():
-    """INT16 upstream carrier: identity dequant at GRU boundary; weight grads match native."""
+    """INT16 upstream carrier: identity dequant at GRU boundary; weight grads match native.
+
+    The A path feeds the GRU an ``Int16QuantizedTensor`` (upstream INT16
+    carrier); inside ``dispatch_quantgru_blackbox`` it is dequantized via
+    ``stop_grad_dequantize`` and forwarded as float. The B path takes the
+    *same* dequantized carrier as float input (rather than the raw ``x_fp``)
+    so that both paths see bit-identical float activations at the GRU
+    boundary. Without this, quant-gru-pytorch v1.0.5's affine ``scale_x_``
+    leaks ~0.5 LSB of round-trip error into the input, which the GRU
+    backward path amplifies into ~1e-4 grad drift — that drift is *expected*
+    (it is the carrier's own quantization error, not a dispatch bug).
+    """
     from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU, _OptionalQuantGRU
 
     torch.manual_seed(1)
@@ -146,11 +157,14 @@ def test_qat_grad_with_int16_upstream_carrier():
     _calibrate_quantgru(gru, x_fp)
     meta = gru.get_io_quant_meta()
 
-    x_q = Int16QuantizedTensor.from_float(
-        x_fp,
-        scale=torch.tensor(meta["input"]["scale"], device="cuda"),
-        zero_point=torch.tensor(meta["input"]["zp"], dtype=torch.int32, device="cuda"),
-    )
+    scale_t = torch.tensor(meta["input"]["scale"], device="cuda")
+    zp_t = torch.tensor(meta["input"]["zp"], dtype=torch.int32, device="cuda")
+    x_q = Int16QuantizedTensor.from_float(x_fp, scale=scale_t, zero_point=zp_t)
+    # Use the same dequantize path that ``dispatch_quantgru_blackbox`` takes
+    # internally (``stop_grad_dequantize`` → ``Int16QuantizedTensor.to_float``)
+    # so the B baseline sees bit-identical float activations at the GRU input.
+    from aimet_torch.fixed_point.gradient_helpers import stop_grad_dequantize
+    x_q_dq = stop_grad_dequantize(x_q).detach().clone()
 
     with quant_execution_mode(ExecutionMode.INT16_FIXED_QAT_SIM):
         out_aimet, _ = dispatch_quantgru_blackbox(gru, x_q)
@@ -158,7 +172,7 @@ def test_qat_grad_with_int16_upstream_carrier():
     aimet_w_grad = gru.weight_ih_l0.grad.detach().clone()
 
     gru.zero_grad(set_to_none=True)
-    x_ref = x_fp.detach().clone().requires_grad_(True)
+    x_ref = x_q_dq.requires_grad_(True)
     with gru._aimet_unlock_ctx():
         aimet_configure(gru, "int16_fixed_qat_sim")
     out_ref, _ = _OptionalQuantGRU.forward(gru, x_ref)

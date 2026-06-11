@@ -55,7 +55,7 @@ def test_quantize_multiplier_known_value():
 def test_quantize_multiplier_per_channel():
     real = torch.tensor([0.1, 0.05, 0.01])
     m, s = quantize_multiplier(real)
-    assert m.dtype == torch.int16
+    assert m.dtype == torch.uint16
     assert s.dtype == torch.int8
     assert m.numel() == 3
 
@@ -83,7 +83,7 @@ def test_freeze_pipeline_writes_sidecar_and_bias():
         assert summary["layer_count"] == 1
         layer_report = summary["layers"]["0"]
         assert layer_report["status"] in ("ok", "warning")
-        assert "multiplier_int16" in layer_report
+        assert "multiplier_uint16" in layer_report
         assert "rshift_int8" in layer_report
         assert "bias_int32_path" in layer_report
         assert os.path.isfile(layer_report["bias_int32_path"])

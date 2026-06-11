@@ -37,71 +37,15 @@ __all__ = [
 def _dispatchable_module_types():
     """Module classes that the INT16 fixed-point adapter knows how to dispatch.
 
-    Imports are deferred to avoid pulling v2 stack at module import time.
+    Sourced from the central capability manifest
+    (:mod:`aimet_torch.fixed_point.capabilities`); imports are deferred so
+    importing this module stays lightweight.
     """
 
     # pylint: disable=import-outside-toplevel
-    from aimet_torch._base.nn.modules import custom
+    from aimet_torch.fixed_point.capabilities import dispatchable_module_types
 
-    types = [
-        nn.Linear,
-        nn.Conv1d,
-        nn.Conv2d,
-        nn.MaxPool2d,
-        nn.AvgPool2d,
-        nn.ReLU,
-        nn.ReLU6,
-        nn.Hardtanh,
-        nn.Sigmoid,
-        nn.Tanh,
-        nn.GELU,
-        nn.SiLU,
-        nn.Mish,
-        nn.Softplus,
-        nn.Hardsigmoid,
-        nn.Hardswish,
-        nn.LeakyReLU,
-        nn.PReLU,
-        nn.Softmax,
-        nn.Flatten,
-        custom.Sin,
-        custom.Cos,
-        custom.Sqrt,
-        custom.RSqrt,
-        custom.Reciprocal,
-        custom.Square,
-        custom.Abs,
-        custom.ElementwiseUnarySign,
-        custom.Exponential,
-        custom.Log,
-        nn.Identity,
-        nn.Dropout,
-        custom.Add,
-        custom.Subtract,
-        custom.Multiply,
-        custom.Divide,
-        custom.MatMul,
-        custom.Concat,
-        custom.Reshape,
-        custom.Permute,
-        custom.Mean,
-        custom.MaxPool2d,
-        custom.AvgPool2d,
-        custom.AdaptiveAvgPool2d,
-        custom.Pad,
-        custom.Clamp,
-        custom.Clip,
-    ]
-
-    try:
-        from aimet_torch.v2.nn.modules.custom import QuantizedQuantGRU
-    except ImportError:
-        QuantizedQuantGRU = None
-
-    if QuantizedQuantGRU is not None:
-        types.append(QuantizedQuantGRU)
-
-    return tuple(types)
+    return dispatchable_module_types()
 
 
 # Public alias resolved lazily so importing this module is cheap.

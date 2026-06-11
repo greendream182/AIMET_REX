@@ -18,7 +18,7 @@ from aimet_torch.fixed_point.requantize import (
 
 def test_requantize_int_basic_half_to_even():
     acc = torch.tensor([100, -100, 32766], dtype=torch.int32)
-    multiplier = torch.tensor(16384, dtype=torch.int16)
+    multiplier = torch.tensor(16384, dtype=torch.uint16)
     rshift = torch.tensor(15, dtype=torch.int8)
     y_zp = torch.tensor(0, dtype=torch.int32)
 
@@ -30,7 +30,7 @@ def test_requantize_int_basic_half_to_even():
 
 def test_requantize_int_saturates():
     acc = torch.tensor([2_000_000_000, -2_000_000_000], dtype=torch.int32)
-    multiplier = torch.tensor(32767, dtype=torch.int16)
+    multiplier = torch.tensor(32767, dtype=torch.uint16)
     rshift = torch.tensor(15, dtype=torch.int8)
     y_zp = torch.tensor(0, dtype=torch.int32)
 
@@ -113,7 +113,7 @@ def test_requantize_int32_product_saturates_before_shift_when_env_enabled(monkey
     """``AIMET_RX_REQUANTIZE_INT32_SAT=1``: prod clamps to INT32 before rshift."""
     monkeypatch.setenv("AIMET_RX_REQUANTIZE_INT32_SAT", "1")
     acc = torch.tensor([66_000], dtype=torch.int32)
-    multiplier = torch.tensor(32767, dtype=torch.int16)
+    multiplier = torch.tensor(32767, dtype=torch.uint16)
     rshift = torch.tensor(17, dtype=torch.int8)
     y_zp = torch.tensor(0, dtype=torch.int32)
 
@@ -128,7 +128,7 @@ def test_requantize_int32_product_no_sat_by_default(monkeypatch):
     monkeypatch.delenv("AIMET_RX_HW_REF", raising=False)
     monkeypatch.delenv("AIMET_RX_PWL_HW_REF", raising=False)
     acc = torch.tensor([66_000], dtype=torch.int32)
-    multiplier = torch.tensor(32767, dtype=torch.int16)
+    multiplier = torch.tensor(32767, dtype=torch.uint16)
     rshift = torch.tensor(17, dtype=torch.int8)
     y_zp = torch.tensor(0, dtype=torch.int32)
 

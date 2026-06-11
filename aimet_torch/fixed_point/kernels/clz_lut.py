@@ -26,6 +26,10 @@ import torch
 
 from aimet_torch._base.nn.modules import custom
 from aimet_torch.fixed_point.encoding import InputEncoding, OutputEncoding
+from aimet_torch.fixed_point.kernels._contracts import (
+    require_int64_within_signed_bit_width,
+)
+from aimet_torch.fixed_point.offline.clz_gen import resolve_abc_lut_root
 from aimet_torch.fixed_point.offline.lut_gen import (
     align_op_quant_grid_to_lut_quant_grid,
     encodings_share_quant_grid,
@@ -408,9 +412,19 @@ def _evaluate_clz_vectorized(
     term_c = seg_term_c[seg_idx]
 
     m_offset = q_m - zp_m
-    bm = _sat_signed_vec(q_b * m_offset, acc_bw)
-    term_bm = _sat_signed_vec(_arsh_round_vec(bm, n_bx), acc_bw)
-    q_y_norm = _sat_signed_vec(term_bm + term_c, acc_bw)
+    raw_bm = q_b * m_offset
+    require_int64_within_signed_bit_width(raw_bm, bit_width=acc_bw, op_name="CLZ.bm")
+    bm = _sat_signed_vec(raw_bm, acc_bw)
+    raw_term_bm = _arsh_round_vec(bm, n_bx)
+    require_int64_within_signed_bit_width(
+        raw_term_bm, bit_width=acc_bw, op_name="CLZ.term_bm"
+    )
+    term_bm = _sat_signed_vec(raw_term_bm, acc_bw)
+    raw_q_y_norm = term_bm + term_c
+    require_int64_within_signed_bit_width(
+        raw_q_y_norm, bit_width=acc_bw, op_name="CLZ.q_y_norm"
+    )
+    q_y_norm = _sat_signed_vec(raw_q_y_norm, acc_bw)
 
     # ---- denormalize_clz (vectorized) ----
     y_offset = q_y_norm - zp_norm_y
@@ -427,15 +441,26 @@ def _evaluate_clz_vectorized(
     if name in ("sqrt", "rsqrt"):
         parity = SQRT2_Q16 if name == "sqrt" else INV_SQRT2_Q16
         is_odd = (exponent & 1).to(torch.bool)
+        require_int64_within_signed_bit_width(
+            val, bit_width=acc_bw, op_name="CLZ.val_pre_parity"
+        )
         val_parity = (_sat_signed_vec(val, acc_bw) * parity) >> Q_SHIFT
         val = torch.where(is_odd, val_parity, val)
 
     net_shift = r_shift - e_int
     val = _arsh_round_vec(val, net_shift)
-    q_y = _sat_signed_vec(val + zp_y, acc_bw)
+    raw_q_y = val + zp_y
+    require_int64_within_signed_bit_width(
+        raw_q_y, bit_width=acc_bw, op_name="CLZ.q_y"
+    )
+    q_y = _sat_signed_vec(raw_q_y, acc_bw)
 
     if sign_neg.any():
-        q_y = torch.where(sign_neg, _sat_signed_vec(2 * zp_y - q_y, acc_bw), q_y)
+        raw_neg = 2 * zp_y - q_y
+        require_int64_within_signed_bit_width(
+            raw_neg, bit_width=acc_bw, op_name="CLZ.q_y_neg"
+        )
+        q_y = torch.where(sign_neg, _sat_signed_vec(raw_neg, acc_bw), q_y)
 
     q_y = q_y.clamp(min=out_qmin, max=out_qmax)
     out = torch.where(special_mask, torch.full_like(q_y, special_val), q_y)
@@ -533,6 +558,78 @@ def _clz_int16_forward(
         qmax=output_encoding.qmax,
         axis=output_encoding.axis,
     )
+
+
+def reciprocal_via_clz_lut(
+    den: Int16QuantizedTensor,
+    clz_body: dict[str, Any],
+) -> Int16QuantizedTensor:
+    """Compute ``1/den`` via reciprocal CLZ LUT, returning at LUT output grid.
+
+    Helper exposed for ``DivideInt16Kernel``'s spec §4.3.4 path:
+    ``y = a / b`` is decomposed into ``recip = 1/b`` (this function) and
+    ``y = a * recip`` (Multiply). The returned tensor lives on the LUT's
+    own output grid (typically signed int16 [-100, 100] for the abc
+    reciprocal asset); the Multiply step folds the LUT output scale into
+    its own ``real_m``. Skipping the standard
+    ``_clz_int16_forward → _remap_lut_q_to_op_grid`` step is intentional
+    — there is no Divide-side "op output grid for 1/b" to remap to.
+    """
+
+    if not isinstance(den, Int16QuantizedTensor):
+        raise TypeError(
+            f"reciprocal_via_clz_lut: den must be Int16QuantizedTensor; "
+            f"got {type(den).__name__}."
+        )
+    quant = clz_body["quantization"]
+    lut_in_enc = _encoding_from_clz_quant(quant["input"])
+    lut_out_enc = _encoding_from_clz_quant(quant["output"])
+
+    op_in_enc = InputEncoding(
+        scale=den.scale,
+        zero_point=den.zero_point,
+        qmin=den.qmin,
+        qmax=den.qmax,
+        axis=den.axis,
+    )
+    q_x = den.int_repr
+    if not encodings_share_quant_grid(lut_in_enc, op_in_enc):
+        q_x = align_op_quant_grid_to_lut_quant_grid(q_x, op_in_enc, lut_in_enc)
+
+    int_repr = evaluate_clz_normalized_lut_int16(q_x, clz_body, "reciprocal")
+    return Int16QuantizedTensor(
+        int_repr=int_repr.to(SIM_TENSOR_DTYPE),
+        scale=lut_out_enc.scale.to(device=int_repr.device),
+        zero_point=lut_out_enc.zero_point.to(
+            device=int_repr.device, dtype=torch.int32
+        ),
+        qmin=lut_out_enc.qmin,
+        qmax=lut_out_enc.qmax,
+    )
+
+
+def try_load_default_reciprocal_clz_lut() -> dict[str, Any] | None:
+    """Best-effort load of the abc-tree's default reciprocal CLZ LUT.
+
+    Returns ``None`` when the abc tree is not in the workspace — callers
+    must then fall back to a non-LUT path. The path is the same canonical
+    location used by ``test_clz_reciprocal_golden.py`` so behaviour stays
+    aligned with the LUT golden tests.
+    """
+
+    abc_root = resolve_abc_lut_root()
+    if abc_root is None:
+        return None
+    json_path = (
+        abc_root / "lut_int_general" / "output" / "lut_test" / "reciprocal_clz_lut.json"
+    )
+    if not json_path.is_file():
+        return None
+    try:
+        _func, body = load_clz_lut_from_json(json_path, func_name="reciprocal")
+        return body
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return None
 
 
 @register_fixed_kernel(custom.Sqrt)

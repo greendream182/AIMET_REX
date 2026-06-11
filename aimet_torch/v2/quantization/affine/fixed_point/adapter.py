@@ -15,7 +15,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -167,7 +167,6 @@ def _maxpool_encodings_match(
 _UNARY_GRID_ONLY_OUTPUT_OPS = frozenset(
     {
         custom.ElementwiseUnarySign,
-        custom.Abs,
     }
 )
 

@@ -32,7 +32,7 @@ def test_concat_kernel_aligns_mismatched_input_scales():
         zero_point=torch.tensor(0, dtype=torch.int32),
         qmin=-128,
         qmax=127,
-        multiplier=torch.tensor(16384, dtype=torch.int16),
+        multiplier=torch.tensor(16384, dtype=torch.uint16),
         rshift=torch.tensor(14, dtype=torch.int8),
     )
     ta = Int16QuantizedTensor.from_float(
