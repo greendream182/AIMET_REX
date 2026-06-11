@@ -87,7 +87,7 @@ def build_output_encoding(
         zero_point=torch.tensor(zero_point, dtype=torch.int32),
         qmin=-32768,
         qmax=32767,
-        multiplier=torch.tensor(multiplier, dtype=torch.int16),
+        multiplier=torch.tensor(multiplier, dtype=torch.uint16),
         rshift=torch.tensor(rshift, dtype=torch.int8),
     )
 

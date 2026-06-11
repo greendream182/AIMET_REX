@@ -14,6 +14,27 @@
 INT16_VS_FP32_MAX_ERROR_LSB = 1.0
 INT16_VS_FP32_MIN_COSINE_SIMILARITY = 0.9999
 
+# INT16 Add — Path A (kernel equiv): ``ref = dequant(A) + dequant(B)`` on fixed integer inputs.
+ADD_INT16_VS_DEQUANT_SUM_MAX_ERROR_LSB = INT16_VS_FP32_MAX_ERROR_LSB
+ADD_INT16_VS_DEQUANT_SUM_MIN_COSINE_SIMILARITY = INT16_VS_FP32_MIN_COSINE_SIMILARITY
+ADD_INT16_VS_DEQUANT_SUM_STRESS_MIN_COSINE_SIMILARITY = 0.999
+
+# Fixed-point Add — Path B (single-op, float32): ``ref = a + b``; gates are strict:
+# ``cosine > 0.9999`` and ``max_error_lsb_float < 1`` (float error < 1 * scale_out).
+# See ``tests/fixed_point/kernels/test_add_ideal_float_reference.py``.
+ADD_IDEAL_FLOAT_MIN_COSINE_EXCLUSIVE = 0.9999
+ADD_IDEAL_FLOAT_MAX_FLOAT_LSB_EXCLUSIVE = 1.0
+# Legacy aliases (inclusive assert_int16_vs_fp32_reference helpers).
+ADD_INT16_VS_IDEAL_FLOAT_MAX_ERROR_LSB = INT16_VS_FP32_MAX_ERROR_LSB
+ADD_INT16_VS_IDEAL_FLOAT_MIN_COSINE_SIMILARITY = INT16_VS_FP32_MIN_COSINE_SIMILARITY
+ADD_INT16_VS_IDEAL_FLOAT_STRESS_MIN_COSINE_SIMILARITY = 0.999
+ADD_INT16_VS_IDEAL_FLOAT_STRESS_MAX_ERROR_LSB = 2.0
+
+# Back-compat aliases (Path A naming).
+ADD_INT16_VS_FLOAT_MAX_ERROR_LSB = ADD_INT16_VS_DEQUANT_SUM_MAX_ERROR_LSB
+ADD_INT16_VS_FLOAT_MIN_COSINE_SIMILARITY = ADD_INT16_VS_DEQUANT_SUM_MIN_COSINE_SIMILARITY
+ADD_INT16_VS_FLOAT_STRESS_MIN_COSINE_SIMILARITY = ADD_INT16_VS_DEQUANT_SUM_STRESS_MIN_COSINE_SIMILARITY
+
 # fp16_qdq vs fp32_qdq (no LSB — floating-point QDQ path)
 FP16_VS_FP32_MIN_COSINE_SIMILARITY = 0.9999
 
@@ -59,6 +80,42 @@ PWL_VS_ANALYTIC_DEFAULT_LIMITS: dict[str, float] = {
 
 # Kept for backwards compatibility with earlier test names; equals sigmoid's max_lsb limit.
 PWL_VS_ANALYTIC_FLOAT_MAX_ERROR_LSB = PWL_VS_ANALYTIC_PER_FN_LIMITS["sigmoid"]["max_lsb"]
+
+# LayerNorm — spec §4.5.4 full integer bit-parity pipeline (§4.5.2 in-line
+# integer variance + RSqrt CLZ LUT + spec line 422-428 16-bit M/rshift
+# affine). Two physical lsb ceilings stack:
+#   1. RSqrt CLZ LUT PWL fit residual (~3-5 LSB at LUT output grid)
+#      amplified by ``γ/std`` — same root cause as P7 ``custom.RSqrt``.
+#   2. Spec line 414's **16-bit M + max_rshift=31** decoding of α_x =
+#      S_γ · S_x · S_inv / S_y. Under i16 calibrated grids ``α_x ≈ 1e-8``,
+#      requiring ``rshift ≈ 41`` for full 16-bit M mantissa — outside
+#      the 31-rshift limit, so the multiplier collapses to ~5-bit and
+#      the affine path lsb explodes proportionally. **This is a spec
+#      design choice, not a kernel implementation bug** (the project-
+#      level ``MULTIPLIER_QBITS = 16`` matches spec line 414 literally).
+# Measured worst-case (16 trials × 6 configs × 2 grids = 192 trials,
+# integer pipeline post FU-DSP-PARITY + FU-AFFINE-INTEGER closure):
+#   noaffine path (α_x = S_x·S_inv/S_y ≈ 3e-4, 16-bit M fits cleanly):
+#     i16: cos_min = 1.000000, lsb_max ≤ 9.74   → ceiling 12.0
+#     i8:  cos_min ≥ 0.999630, lsb_max ≤ 2.27   → ceiling 4.0
+#   affine path (α_x ≈ 1e-8 — spec 16-bit M physical ceiling):
+#     i16: cos_min ≥ 0.999994, lsb_max ≤ 910    → ceiling 1100.0
+#     i8:  cos_min ≥ 0.999229, lsb_max ≤ 5.33   → ceiling 8.0
+# Cosine clears 0.9999 on every measured case because the residual is
+# magnitude-bounded. Tightening past these ceilings requires either a
+# wider multiplier ABI in hardware (out of project scope — would change
+# spec line 414) or a redesigned α_x factoring (tracked as
+# FU-LAYERNORM-ALPHA-X-CALIBRATION).
+LAYERNORM_VS_FP32_PER_GRID_LIMITS: dict[str, dict[str, dict[str, float]]] = {
+    "i16": {
+        "noaffine": {"max_lsb": 12.0, "min_cosine": 0.9999},
+        "affine":   {"max_lsb": 1100.0, "min_cosine": 0.9999},
+    },
+    "i8": {
+        "noaffine": {"max_lsb": 4.0, "min_cosine": 0.9999},
+        "affine":   {"max_lsb": 8.0, "min_cosine": 0.9999},
+    },
+}
 
 # INT16 single-op (v2 Quantized* vs FP32_QDQ): per-case cosine floors.
 # Deploy-style 8-bit outputs absorb PWL error; GELU chains need a much looser gate.

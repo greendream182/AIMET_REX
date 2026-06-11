@@ -67,7 +67,7 @@ def test_output_encoding_json_roundtrip():
         zero_point=torch.tensor([1, 2], dtype=torch.int32),
         qmin=-32768,
         qmax=32767,
-        multiplier=torch.tensor([1200, 1300], dtype=torch.int16),
+        multiplier=torch.tensor([1200, 1300], dtype=torch.uint16),
         rshift=torch.tensor([14, 15], dtype=torch.int8),
     )
     data = output_encoding_to_dict(enc)
@@ -86,7 +86,7 @@ def test_fixed_point_bundle_includes_pwl_sidecar():
         zero_point=torch.tensor(0, dtype=torch.int32),
         qmin=-32768,
         qmax=32767,
-        multiplier=torch.tensor(1000, dtype=torch.int16),
+        multiplier=torch.tensor(1000, dtype=torch.uint16),
         rshift=torch.tensor(12, dtype=torch.int8),
     )
     ienc = InputEncoding(
