@@ -1,0 +1,4 @@
+{
+  "description": "Linear (3->2, with bias) byte-stream golden. Pins requantize-int32 contract under ``_requantize_output``.",
+  "expected_dtype": "int16"
+}

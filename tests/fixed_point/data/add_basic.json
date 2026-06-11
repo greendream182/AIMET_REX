@@ -1,0 +1,4 @@
+{
+  "description": "custom.Add same-grid scale-aligned add. Pins int32_add_sat + zp add-back path.",
+  "expected_dtype": "int16"
+}

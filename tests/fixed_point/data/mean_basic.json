@@ -1,0 +1,6 @@
+{
+  "description": "custom.Mean over (2,3) keepdim=True, N=16. Pins reduce_size contract + 1/N-folded multiplier.",
+  "expected_dtype": "int16",
+  "reduce_size": 16,
+  "rng_seed": 42
+}

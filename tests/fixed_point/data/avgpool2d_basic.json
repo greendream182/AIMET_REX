@@ -1,0 +1,4 @@
+{
+  "description": "AvgPool2d 4x4\u21922x2 (kernel=2,stride=2). Pins 1/N-folded multiplier+rshift contract and the INT32 saturation gate at the requantize boundary.",
+  "expected_dtype": "int16"
+}
